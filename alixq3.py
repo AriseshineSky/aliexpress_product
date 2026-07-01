@@ -700,36 +700,67 @@ def _get_api_result(api_data: dict[str, Any] | None) -> dict[str, Any]:
     return {}
 
 
+def _extract_sale_price(info: dict[str, Any]) -> float:
+    """Extract current sale/activity price from AliExpress price info."""
+    if not isinstance(info, dict):
+        return 0.0
+    sale_obj = info.get("salePrice") or info.get("saleAmount") or {}
+    if isinstance(sale_obj, dict):
+        value = to_float(sale_obj.get("value"))
+        if value > 0:
+            return value
+    sale_string = str(info.get("salePriceString") or "").strip()
+    if sale_string:
+        value = to_float(sale_string.replace("$", "").replace(",", ""))
+        if value > 0:
+            return value
+    sale_local = str(info.get("salePriceLocal") or "").strip()
+    if sale_local:
+        head = sale_local.split("|", 1)[0]
+        value = to_float(head.replace("$", "").replace(",", ""))
+        if value > 0:
+            return value
+    for key in ("maxActivityAmount", "minActivityAmount"):
+        nested = info.get(key) or {}
+        if isinstance(nested, dict):
+            value = to_float(nested.get("value"))
+            if value > 0:
+                return value
+    return 0.0
+
+
 def pick_price_from_api(api_data: dict[str, Any]) -> float:
-    """从 MTOP API 返回数据中提取价格（新结构: data.result.PRICE）"""
+    """从 MTOP API 返回数据中提取销售价（新结构: data.result.PRICE）"""
     result = _get_api_result(api_data)
     price_data = result.get("PRICE") or result.get("priceModule") or {}
-    target = price_data.get("targetSkuPriceInfo") or {}
-    if target:
-        if "salePriceLocal" in target:
-            # format: "2,980円|2980|"
-            match = re.search(r"\|(\d+)\|", str(target["salePriceLocal"]))
-            if match:
-                p = to_float(match.group(1))
-                if p > 0:
-                    return p
-        sale = str(target.get("salePriceString") or "")
-        p = to_float(sale)
-        if p > 0:
-            return p
-    # fallback: try old structure
+    if isinstance(price_data, dict):
+        target = price_data.get("targetSkuPriceInfo") or {}
+        price = _extract_sale_price(target)
+        if price > 0:
+            return price
+        sku_map = price_data.get("skuIdStrPriceInfoMap") or {}
+        selected_sku = str(price_data.get("selectedSkuId") or "")
+        if selected_sku and selected_sku in sku_map:
+            price = _extract_sale_price(sku_map[selected_sku])
+            if price > 0:
+                return price
+        sale_prices = [_extract_sale_price(info) for info in sku_map.values()]
+        sale_prices = [p for p in sale_prices if p > 0]
+        if sale_prices:
+            return min(sale_prices)
+    # fallback: try old structure (activity/discount price only)
     price_module = result.get("priceModule") or {}
     price_component = result.get("priceComponent") or {}
     candidates = [
         price_component.get("maxActivityAmount", {}).get("value"),
         price_component.get("minActivityAmount", {}).get("value"),
-        price_component.get("maxAmount", {}).get("value"),
-        price_component.get("minAmount", {}).get("value"),
         (price_module.get("discountPrice") or {}).get("maxActivityAmount", {}).get("value"),
         (price_module.get("discountPrice") or {}).get("minActivityAmount", {}).get("value"),
+        price_module.get("formatedActivityPrice"),
+        price_component.get("maxAmount", {}).get("value"),
+        price_component.get("minAmount", {}).get("value"),
         (price_module.get("origPrice") or {}).get("maxAmount", {}).get("value"),
         (price_module.get("origPrice") or {}).get("minAmount", {}).get("value"),
-        price_module.get("formatedActivityPrice"),
         price_module.get("formatedPrice"),
     ]
     for candidate in candidates:
@@ -813,6 +844,286 @@ def get_currency_from_api(api_data: dict[str, Any]) -> str:
     return str(currency).upper() if currency else "USD"
 
 
+def _sku_property_value_id(property_value: dict[str, Any]) -> str:
+    value_id = property_value.get("propertyValueId")
+    if value_id in (None, "", "0", 0):
+        value_id = property_value.get("propertyValueIdLong")
+    return str(value_id or "")
+
+
+def _adapt_modular_sku_properties(sku_block: dict[str, Any]) -> list[dict[str, Any]]:
+    properties: list[dict[str, Any]] = []
+    for sku_property in sku_block.get("skuProperties") or []:
+        if not isinstance(sku_property, dict):
+            continue
+        values: list[dict[str, Any]] = []
+        for property_value in sku_property.get("skuPropertyValues") or []:
+            if not isinstance(property_value, dict):
+                continue
+            values.append(
+                {
+                    "propertyValueId": property_value.get("propertyValueId"),
+                    "propertyValueIdLong": property_value.get("propertyValueIdLong"),
+                    "propertyValueName": property_value.get("propertyValueName", ""),
+                    "propertyValueDisplayName": property_value.get("propertyValueDisplayName")
+                    or property_value.get("propertyValueDefinitionName", ""),
+                    "skuPropertyImagePath": property_value.get("skuPropertyImagePath", ""),
+                }
+            )
+        properties.append(
+            {
+                "skuPropertyId": sku_property.get("skuPropertyId"),
+                "skuPropertyName": sku_property.get("skuPropertyName", ""),
+                "skuPropertyValues": values,
+            }
+        )
+    return properties
+
+
+def _price_amount_from_sku_info(info: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    original = info.get("originalPrice") or {}
+    currency = original.get("currency") or "USD"
+    original_value = to_float(original.get("value"))
+    sale_value = _extract_sale_price(info)
+    if sale_value <= 0:
+        sale_value = original_value
+    return (
+        {"currency": currency, "value": original_value},
+        {"currency": currency, "value": sale_value},
+    )
+
+
+def _adapt_modular_sku_price_list(
+    sku_block: dict[str, Any], sku_map: dict[str, Any]
+) -> list[dict[str, Any]]:
+    sku_price_list: list[dict[str, Any]] = []
+    for path in sku_block.get("skuPaths") or []:
+        if not isinstance(path, dict):
+            continue
+        sku_id = str(path.get("skuIdStr") or path.get("skuId") or "")
+        price_info = sku_map.get(sku_id) or {}
+        _, sale_amount = _price_amount_from_sku_info(price_info)
+        stock = path.get("skuStock")
+        if stock is None:
+            stock = 100 if path.get("salable", True) else 0
+        sku_price_list.append(
+            {
+                "skuAttr": path.get("skuAttr") or path.get("path") or sku_id,
+                "skuVal": {
+                    "availQuantity": to_int(stock),
+                    "skuAmount": sale_amount,
+                },
+            }
+        )
+    if sku_price_list:
+        return sku_price_list
+
+    for sku_id, info in sku_map.items():
+        _, sale_amount = _price_amount_from_sku_info(info)
+        sku_price_list.append(
+            {
+                "skuAttr": str(sku_id),
+                "skuVal": {
+                    "availQuantity": 100,
+                    "skuAmount": sale_amount,
+                },
+            }
+        )
+    return sku_price_list
+
+
+def _extract_sku_module(api_result: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    sku_block = api_result.get("SKU") or {}
+    if isinstance(sku_block, dict) and sku_block:
+        price_block = api_result.get("PRICE") or {}
+        sku_map = price_block.get("skuIdStrPriceInfoMap") or {} if isinstance(price_block, dict) else {}
+        return (
+            _adapt_modular_sku_properties(sku_block),
+            _adapt_modular_sku_price_list(sku_block, sku_map),
+        )
+
+    legacy_module = api_result.get("skuModule") or api_result.get("skuComponent") or {}
+    if not isinstance(legacy_module, dict):
+        return [], []
+    return (
+        legacy_module.get("productSKUPropertyList") or [],
+        legacy_module.get("skuPriceList") or [],
+    )
+
+
+def _get_sku_price_from_val(sku_val: dict[str, Any]) -> float:
+    for key in (
+        "actSkuCalPrice",
+        "actSkuMultiCurrencyCalPrice",
+        "actSkuMultiCurrencyDisplayPrice",
+    ):
+        value = to_float(sku_val.get(key))
+        if value > 0:
+            return value
+    sku_amount = to_float((sku_val.get("skuAmount") or {}).get("value"))
+    if sku_amount > 0:
+        return sku_amount
+    for key in (
+        "skuCalPrice",
+        "skuMultiCurrencyCalPrice",
+        "skuMultiCurrencyDisplayPrice",
+    ):
+        value = to_float(sku_val.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _build_options_mapping(product_sku_property_list: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    options_mapping: dict[str, dict[str, Any]] = {}
+    for sku_property in product_sku_property_list:
+        option_id = str(sku_property.get("skuPropertyId") or "")
+        if not option_id:
+            continue
+        skus: dict[str, dict[str, Any]] = {}
+        for property_value in sku_property.get("skuPropertyValues") or []:
+            if not isinstance(property_value, dict):
+                continue
+            sku_id = _sku_property_value_id(property_value)
+            if not sku_id:
+                continue
+            sku_meta = {
+                "id": sku_id,
+                "name": property_value.get("propertyValueName", ""),
+                "presentation": property_value.get("propertyValueDisplayName")
+                or property_value.get("propertyValueName", ""),
+                "img_url": normalize_image_url(property_value.get("skuPropertyImagePath", "")),
+            }
+            skus[sku_id] = sku_meta
+            long_id = property_value.get("propertyValueIdLong")
+            if long_id not in (None, "", "0", 0):
+                skus[str(long_id)] = sku_meta
+            short_id = property_value.get("propertyValueId")
+            if short_id not in (None, "", "0", 0):
+                skus[str(short_id)] = sku_meta
+        options_mapping[option_id] = {
+            "option_name": sku_property.get("skuPropertyName", ""),
+            "skus": skus,
+        }
+    return options_mapping
+
+
+def _build_option_values(
+    sku_attr: str, options_mapping: dict[str, dict[str, Any]]
+) -> list[dict[str, str]]:
+    option_values: list[dict[str, str]] = []
+    if not sku_attr:
+        return option_values
+    for part in sku_attr.split(";"):
+        attr = part.split("#")[0]
+        attr_parts = attr.split(":")
+        if len(attr_parts) < 2:
+            continue
+        option_id, option_val = attr_parts[0], attr_parts[1]
+        option = options_mapping.get(option_id)
+        if not option:
+            continue
+        sku = option["skus"].get(option_val)
+        if not sku:
+            continue
+        option_values.append(
+            {
+                "option_id": option_id,
+                "option_value_id": option_val,
+                "option_name": option["option_name"],
+                "option_value": sku.get("presentation") or sku.get("name") or option_val,
+            }
+        )
+    return option_values
+
+
+def _options_from_dom(dom_data: dict[str, Any]) -> list[dict[str, Any]] | None:
+    raw_options = dom_data.get("skuOptions") or []
+    if not raw_options:
+        return None
+    options: list[dict[str, Any]] = []
+    for item in raw_options:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        option_id = str(item.get("id") or "").strip()
+        if not name or not option_id:
+            continue
+        options.append({"name": name, "id": option_id})
+    return options or None
+
+
+def parse_options_and_variants(
+    api_result: dict[str, Any],
+    product_id: str,
+    currency: str,
+    dom_data: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None, bool, float, int | None]:
+    product_sku_property_list, sku_price_list = _extract_sku_module(api_result)
+    options_mapping = _build_options_mapping(product_sku_property_list)
+    standard_options = [
+        {"name": meta["option_name"], "id": option_id}
+        for option_id, meta in options_mapping.items()
+        if meta.get("option_name")
+    ] or None
+
+    if len(sku_price_list) <= 1:
+        dom_options = _options_from_dom(dom_data or {})
+        if dom_options and not standard_options:
+            standard_options = dom_options
+        available_qty = None
+        if sku_price_list:
+            available_qty = to_int((sku_price_list[0].get("skuVal") or {}).get("availQuantity"))
+        return standard_options, None, True, 0.0, available_qty
+
+    variants: list[dict[str, Any]] = []
+    prices: list[float] = []
+    total_qty = 0
+    for sku_product in sku_price_list:
+        sku_attr = str(sku_product.get("skuAttr") or "")
+        sku_val = sku_product.get("skuVal") or {}
+        quantity = to_int(sku_val.get("availQuantity"))
+        if quantity <= 0:
+            continue
+        formatted_attr = ";".join(part.split("#")[0] for part in sku_attr.split(";") if part)
+        option_values = _build_option_values(sku_attr, options_mapping)
+        variant_images = None
+        for ov in option_values:
+            option = options_mapping.get(ov.get("option_id") or "")
+            if not option:
+                continue
+            sku_meta = option["skus"].get(ov.get("option_value_id") or "")
+            if sku_meta and sku_meta.get("img_url"):
+                variant_images = sku_meta["img_url"]
+                break
+        variant_price = _get_sku_price_from_val(sku_val)
+        if variant_price > 0:
+            prices.append(variant_price)
+        total_qty += quantity
+        variants.append(
+            {
+                "sku": f"ALI_{product_id}_{formatted_attr or 'default'}",
+                "barcode": None,
+                "variant_id": formatted_attr or str(product_id),
+                "price": variant_price,
+                "currency": currency,
+                "available_qty": quantity,
+                "option_values": option_values,
+                "images": variant_images,
+            }
+        )
+
+    has_only_default_variant = len(variants) == 0
+    if has_only_default_variant:
+        dom_options = _options_from_dom(dom_data or {})
+        if dom_options and not standard_options:
+            standard_options = dom_options
+        return standard_options, None, True, 0.0, None
+
+    variant_price = min(prices) if prices else 0.0
+    return standard_options, variants, False, variant_price, total_qty or None
+
+
 def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[dict[str, Any]],
                           dom_data: dict[str, Any], url: str) -> dict[str, Any]:
     """合并数据映射为 30 字段 Schema。优先级: LD+JSON > DOM > API"""
@@ -841,12 +1152,16 @@ def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[di
     if not title:
         title = "ERROR"
 
-    # ---- price: LD+JSON > API > DOM ----
+    # ---- price: API sale > LD+JSON > DOM; multi-variant uses min sale ----
     price = 0.0
-    if ld_product.get("offers"):
-        price = to_float(ld_product["offers"].get("price", 0))
-    if price <= 0 and api_result:
-        price = pick_price_from_api(api_data) if api_data else 0.0
+    if api_result and api_data:
+        price = pick_price_from_api(api_data)
+    if price <= 0:
+        offers = ld_product.get("offers") or {}
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        if isinstance(offers, dict):
+            price = to_float(offers.get("lowPrice") or offers.get("price") or 0)
     if price <= 0:
         price = to_float(dom_data.get("priceText", ""))
 
@@ -943,6 +1258,17 @@ def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[di
     # ---- description: DOM > API ----
     description = clean_product_description(str(dom_data.get("description") or ""))
 
+    options, variants, has_only_default_variant, variant_price, available_qty = parse_options_and_variants(
+        api_result,
+        pid,
+        currency,
+        dom_data,
+    )
+    if variant_price > 0:
+        price = variant_price
+    if variants:
+        print(f"  [SKU] options={len(options or [])} variants={len(variants)}")
+
     return {
         "date": datetime.now().replace(microsecond=0).isoformat(),
         "url": normalize_https_url(url),
@@ -962,9 +1288,9 @@ def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[di
         "videos": videos,
         "price": price,
         "currency": currency,
-        "available_qty": None,
-        "options": None,
-        "variants": None,
+        "available_qty": available_qty,
+        "options": options,
+        "variants": variants,
         "returnable": None,
         "reviews": reviews,
         "rating": rating,
@@ -976,7 +1302,7 @@ def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[di
         "width": None,
         "height": None,
         "length": None,
-        "has_only_default_variant": True,
+        "has_only_default_variant": has_only_default_variant,
         "_id": product_doc_id(source, pid),
     }
 
@@ -1001,11 +1327,73 @@ async def navigate_product_page(page: Page, full_url: str, captcha_state: dict[s
 
 
 def parse_api_response_body(body: str) -> dict[str, Any] | None:
-    match = re.search(r"/\*\*/\w+\((.*)\)\s*$", body, re.S)
-    if not match:
+    text = (body or "").strip()
+    if not text:
         return None
-    parsed = json.loads(match.group(1))
-    return parsed if isinstance(parsed, dict) else None
+    for pattern in (
+        r"mtopjsonp\d+\((.*)\)\s*$",
+        r"/\*\*/\w+\((.*)\)\s*$",
+        r"^\s*(\{.*\})\s*$",
+    ):
+        match = re.search(pattern, text, re.S)
+        if not match:
+            continue
+        try:
+            parsed = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _score_pdp_api_payload(parsed: dict[str, Any], body_len: int) -> int:
+    score = body_len
+    result = _get_api_result(parsed)
+    if not result:
+        return score
+    if result.get("SKU"):
+        score += 10_000_000
+    if result.get("PRICE"):
+        score += 1_000_000
+    if result.get("PRODUCT_TITLE") or result.get("PC_RATING"):
+        score += 100_000
+    ret = parsed.get("ret") or []
+    if any("FAIL" in str(item).upper() for item in ret):
+        score -= 50_000_000
+    return score
+
+
+async def capture_pdp_api_data(page: Page, navigate: Any) -> dict[str, Any] | None:
+    """Collect the richest mtop.aliexpress.pdp.pc.query response during navigation."""
+    best: tuple[int, dict[str, Any]] | None = None
+
+    async def on_response(response: Any) -> None:
+        nonlocal best
+        url = response.url
+        if "mtop.aliexpress.pdp.pc.query" not in url:
+            return
+        if "punish" in url or "_____tmd_____" in url:
+            return
+        try:
+            body = await response.text()
+        except Exception:
+            return
+        parsed = parse_api_response_body(body)
+        if not parsed:
+            return
+        score = _score_pdp_api_payload(parsed, len(body))
+        if best is None or score > best[0]:
+            best = (score, parsed)
+
+    page.on("response", on_response)
+    try:
+        await navigate()
+        await page.wait_for_timeout(3500)
+    finally:
+        page.remove_listener("response", on_response)
+
+    return best[1] if best else None
 
 
 def is_captcha_text(text: str) -> bool:
@@ -1537,7 +1925,31 @@ async def extract_dom_data(page: Page) -> dict[str, Any]:
           if (reviewsMatch) reviews = reviewsMatch[1].replace(/,/g, '');
           const soldMatch = bodyText.match(/([\\d,]+\\+?)\\s*\\S*\\s*(?:販売|sold|vendidos)/i);
           if (soldMatch) soldCount = soldMatch[1].replace(/,/g, '');
-          return { title, priceText, categories: breadItems, rating, reviews, soldCount };
+          const skuOptions = [];
+          document.querySelectorAll('[data-sku-row]').forEach((rowEl) => {
+            const rowId = rowEl.getAttribute('data-sku-row');
+            if (!rowId) return;
+            const box = rowEl.closest('[class*="sku-item--box"]') || rowEl.parentElement;
+            let propName = '';
+            if (box) {
+              let prev = box.previousElementSibling;
+              while (prev && !propName) {
+                const text = (prev.innerText || '').replace(/\\s+/g, ' ').trim();
+                if (text) propName = text.split(':')[0].trim();
+                prev = prev.previousElementSibling;
+              }
+            }
+            const values = [];
+            rowEl.querySelectorAll('[data-sku-col]').forEach((colEl) => {
+              const col = colEl.getAttribute('data-sku-col') || '';
+              const title = colEl.getAttribute('title') || (colEl.innerText || '').trim();
+              const dashIdx = col.indexOf('-');
+              const valueId = dashIdx >= 0 ? col.slice(dashIdx + 1) : col;
+              if (valueId) values.push({ id: valueId, name: title, presentation: title });
+            });
+            if (propName && values.length) skuOptions.push({ id: rowId, name: propName, values });
+          });
+          return { title, priceText, categories: breadItems, rating, reviews, soldCount, skuOptions };
         }"""
     )
     images = await page.evaluate(
@@ -1669,28 +2081,20 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     full_url = url if "gatewayAdapt" in url else f"{url}?gatewayAdapt=glo2usa"
     api_data: dict[str, Any] | None = None
 
-    try:
-        async with page.expect_response(
-            lambda response: "mtop.aliexpress.pdp.pc.query" in response.url,
-            timeout=90000,
-        ) as response_info:
-            await page.goto(full_url, wait_until="domcontentloaded", timeout=90000)
-            await page.wait_for_timeout(2500)
-            await handle_captcha(page, captcha_state, product_url=full_url)
-            await sleep(short=True)
-            try:
-                response = await response_info.value
-                api_data = parse_api_response_body(await response.text())
-                if api_data:
-                    print("  [API] 拦截到 mtop.aliexpress.pdp.pc.query 响应")
-            except PlaywrightTimeoutError:
-                print("  [API] 未在 90s 内拦截到 pdp 接口，降级使用 LD+JSON")
-    except PlaywrightTimeoutError:
+    async def navigate_product() -> None:
         await page.goto(full_url, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_timeout(2500)
         await handle_captcha(page, captcha_state, product_url=full_url)
         await sleep(short=True)
-        print("  [API] 未在 90s 内拦截到 pdp 接口，降级使用 LD+JSON")
+
+    try:
+        api_data = await capture_pdp_api_data(page, navigate_product)
+        if api_data:
+            print("  [API] 拦截到 mtop.aliexpress.pdp.pc.query 响应")
+        else:
+            print("  [API] 未拦截到有效 pdp 接口，降级使用 LD+JSON")
+    except Exception as exc:
+        print(f"  [API] 页面加载失败，降级使用 LD+JSON: {exc}")
 
     # ---- 第四步：提取 LD+JSON + DOM 数据 ----
     ld_json_list = await extract_ld_json(page)
@@ -1698,6 +2102,25 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     description = await extract_product_description(page)
     if description:
         dom_data["description"] = description
+
+    run_params = await page.evaluate(
+        "() => (window.runParams && window.runParams.data) ? window.runParams.data : null"
+    )
+    if run_params:
+        api_data = api_data or {"data": {"result": {}}}
+        api_result = _get_api_result(api_data)
+        if not isinstance(api_result, dict):
+            api_result = {}
+            if isinstance(api_data.get("data"), dict):
+                api_data["data"]["result"] = api_result
+        sku_module = run_params.get("skuModule") or run_params.get("skuComponent") or {}
+        if sku_module and not api_result.get("SKU"):
+            api_result["skuModule"] = sku_module
+        price_component = run_params.get("priceComponent") or {}
+        if price_component.get("skuPriceList"):
+            api_result.setdefault("skuModule", {})
+            if isinstance(api_result["skuModule"], dict):
+                api_result["skuModule"]["skuPriceList"] = price_component["skuPriceList"]
 
     # ---- 第五步：如果有 API 数据，尝试获取远程描述 ----
     if api_data:
