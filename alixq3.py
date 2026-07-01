@@ -335,6 +335,49 @@ def product_doc_id(source: str, product_id: str) -> str:
     return f"{source}_{product_id}"
 
 
+def is_generic_page_title(title: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(title or "").strip().lower())
+    if not normalized or normalized == "error":
+        return True
+    if normalized in GENERIC_PAGE_TITLES:
+        return True
+    if len(normalized) <= 20 and normalized.replace(".", "") in {"aliexpress", "aliexpresscom", "aliexpressus"}:
+        return True
+    return False
+
+
+def is_unavailable_product_page(
+    *,
+    api_data: dict[str, Any] | None,
+    record: dict[str, Any],
+    dom_data: dict[str, Any],
+    page_text: str,
+    original_url: str,
+    final_url: str,
+) -> bool:
+    """Detect delisted / 404 / redirect-to-other-product pages."""
+    if api_data:
+        api_result = _get_api_result(api_data)
+        i18n = api_result.get("GLOBAL_DATA", {}).get("i18n", {}) or {}
+        if i18n.get("ItemDetailResp", {}).get("PAGE_NOT_FOUND_NOTICE"):
+            return True
+
+    original_pid = product_id_from_url(original_url)
+    final_pid = product_id_from_url(final_url)
+    if original_pid and final_pid and original_pid != final_pid:
+        return True
+
+    lowered_page_text = str(page_text or "").lower()
+    if any(marker in lowered_page_text for marker in NOT_FOUND_PAGE_MARKERS):
+        return True
+
+    title = str(record.get("title") or "").strip()
+    if is_generic_page_title(title):
+        return True
+
+    return False
+
+
 def normalize_image_url(url: str) -> str:
     if not url:
         return ""
@@ -368,6 +411,25 @@ def to_int(value: Any, default: int = 0) -> int:
 PLACEHOLDER_IMAGE = "https://ae01.alicdn.com/kf/S4dae688db3454ee4b1bc54ed018dcbd3l.jpg"
 MISSING_PRODUCT_DESCRIPTION = "<p>Product does not exist or is unavailable.</p>"
 MISSING_PRODUCT_TITLE_PREFIX = "Unavailable Product"
+GENERIC_PAGE_TITLES = frozenset(
+    {
+        "aliexpress",
+        "aliexpress.com",
+        "aliexpress.us",
+        "aliexpress - online shopping for popular electronics, fashion, home & garden, toys & sports, automobiles and more.",
+    }
+)
+NOT_FOUND_PAGE_MARKERS = (
+    "page not found",
+    "page you requested can not be found",
+    "page you requested cannot be found",
+    "sorry, this item",
+    "item is no longer available",
+    "item you requested doesn't exist",
+    "product you are trying to view is not available",
+    "this product is no longer available",
+    "page_not_found_notice",
+)
 
 
 def clean_html(html: str) -> str:
@@ -454,7 +516,7 @@ def make_empty_record(url: str) -> dict[str, Any]:
     """不存在商品的兜底记录，通过 StandardProduct 校验后写入 ES。"""
     pid = product_id_from_url(url)
     source = source_from_url(url)
-    return {
+    record = {
         "date": datetime.now().replace(microsecond=0).isoformat(),
         "url": normalize_https_url(url),
         "source": source,
@@ -1327,15 +1389,26 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
                 pass
 
     # ---- 第六步：构建标准记录 ----
+    final_url = page.url
+    original_pid = product_id_from_url(url)
+    final_pid = product_id_from_url(final_url)
+    if original_pid and final_pid and original_pid != final_pid:
+        print(f"  [重定向] product_id 变化: {original_pid} -> {final_pid}")
+        print(f"  [重定向] 最终 URL: {final_url[:160]}")
+
+    page_text = await page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 8000) : ''")
     record = build_standard_record(api_data, ld_json_list, dom_data, url)
 
-    # 检查是否 404 页面
-    if api_data:
-        api_result = _get_api_result(api_data)
-        i18n = api_result.get("GLOBAL_DATA", {}).get("i18n", {}) or {}
-        if i18n.get("ItemDetailResp", {}).get("PAGE_NOT_FOUND_NOTICE"):
-            print(f"  页面不存在：{url}")
-            return make_empty_record(url)
+    if is_unavailable_product_page(
+        api_data=api_data,
+        record=record,
+        dom_data=dom_data,
+        page_text=str(page_text or ""),
+        original_url=url,
+        final_url=final_url,
+    ):
+        print(f"  商品不可用（下架/404/重定向失效）: {url}")
+        return make_empty_record(url)
 
     if not record.get("title") or record["title"] == "ERROR":
         print(f"  未提取到有效标题：{url}")

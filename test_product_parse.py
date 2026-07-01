@@ -50,6 +50,33 @@ class ProductParseTestCase(unittest.TestCase):
             "aliexpress.us_123",
         )
 
+    def test_unavailable_product_detects_generic_title_and_redirect(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        original = "https://www.aliexpress.com/item/1005002295468695.html"
+        redirected = "https://www.aliexpress.com/item/1005009999999999.html"
+        record = {
+            "title": "Aliexpress",
+            "price": 0.0,
+            "images": mod.PLACEHOLDER_IMAGE,
+            "specifications": None,
+            "categories": None,
+        }
+        self.assertTrue(
+            mod.is_unavailable_product_page(
+                api_data=None,
+                record=record,
+                dom_data={},
+                page_text="",
+                original_url=original,
+                final_url=redirected,
+            )
+        )
+        self.assertTrue(mod.is_generic_page_title("Aliexpress"))
+
 
 if __name__ == "__main__":
     unittest.main()
