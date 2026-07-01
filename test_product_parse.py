@@ -77,6 +77,24 @@ class ProductParseTestCase(unittest.TestCase):
         )
         self.assertTrue(mod.is_generic_page_title("Aliexpress"))
 
+    def test_build_redirect_info(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        original = "https://www.aliexpress.us/item/1005004506189269.html"
+        final = "https://www.aliexpress.us/item/3256804319874517.html?gatewayAdapt=4itemAdapt"
+        info = mod.build_redirect_info(original, final)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["redirect_product_id"], "3256804319874517")
+        record = mod.make_empty_record(original, redirect_info=info)
+        validated, error = mod.validate_product_record(record)
+        self.assertIsNone(error, msg=error)
+        self.assertFalse(validated["existence"])
+        self.assertIn("3256804319874517", validated["summary"])
+        self.assertIn("3256804319874517", validated["description"])
+
 
 if __name__ == "__main__":
     unittest.main()

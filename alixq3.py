@@ -355,6 +355,30 @@ def is_generic_page_title(title: str) -> bool:
     return False
 
 
+def build_redirect_info(original_url: str, final_url: str) -> dict[str, str] | None:
+    """Return redirect metadata when final page uses a different product_id."""
+    original_pid = product_id_from_url(original_url)
+    final_pid = product_id_from_url(final_url)
+    if not original_pid or not final_pid or original_pid == final_pid:
+        return None
+    return {
+        "reason": "product_id_redirect",
+        "original_product_id": original_pid,
+        "redirect_product_id": final_pid,
+        "original_url": normalize_https_url(original_url),
+        "final_url": normalize_https_url(final_url),
+        "final_source": source_from_url(final_url),
+    }
+
+
+def format_redirect_summary(redirect_info: dict[str, str]) -> str:
+    return (
+        f"reason={redirect_info['reason']}; "
+        f"redirect_product_id={redirect_info['redirect_product_id']}; "
+        f"final_url={redirect_info['final_url']}"
+    )
+
+
 def is_unavailable_product_page(
     *,
     api_data: dict[str, Any] | None,
@@ -521,10 +545,23 @@ def validate_product_record(record: dict[str, Any]) -> tuple[dict[str, Any] | No
         return None, str(exc)
 
 
-def make_empty_record(url: str) -> dict[str, Any]:
+def make_empty_record(
+    url: str,
+    *,
+    redirect_info: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """不存在商品的兜底记录，通过 StandardProduct 校验后写入 ES。"""
     pid = product_id_from_url(url)
     source = source_from_url(url)
+    description = MISSING_PRODUCT_DESCRIPTION
+    summary = None
+    if redirect_info:
+        summary = format_redirect_summary(redirect_info)
+        description = (
+            "<p>Product unavailable. Original listing redirected to another product ID.</p>"
+            f"<p>Redirect product ID: {redirect_info['redirect_product_id']}</p>"
+            f"<p>Final URL: {redirect_info['final_url']}</p>"
+        )
     record = {
         "date": datetime.now().replace(microsecond=0).isoformat(),
         "url": normalize_https_url(url),
@@ -533,8 +570,8 @@ def make_empty_record(url: str) -> dict[str, Any]:
         "existence": False,
         "title": f"{MISSING_PRODUCT_TITLE_PREFIX} {pid}",
         "title_en": None,
-        "description": MISSING_PRODUCT_DESCRIPTION,
-        "summary": None,
+        "description": description,
+        "summary": summary,
         "sku": pid,
         "upc": None,
         "brand": None,
@@ -1487,11 +1524,13 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
 
     # ---- 第六步：构建标准记录 ----
     final_url = page.url
-    original_pid = product_id_from_url(url)
-    final_pid = product_id_from_url(final_url)
-    if original_pid and final_pid and original_pid != final_pid:
-        print(f"  [重定向] product_id 变化: {original_pid} -> {final_pid}")
-        print(f"  [重定向] 最终 URL: {final_url[:160]}")
+    redirect_info = build_redirect_info(url, final_url)
+    if redirect_info:
+        print(
+            f"  [重定向] product_id 变化: {redirect_info['original_product_id']} "
+            f"-> {redirect_info['redirect_product_id']}"
+        )
+        print(f"  [重定向] 最终 URL: {redirect_info['final_url'][:160]}")
 
     page_text = await page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 8000) : ''")
     record = build_standard_record(api_data, ld_json_list, dom_data, url)
@@ -1504,12 +1543,18 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         original_url=url,
         final_url=final_url,
     ):
-        print(f"  商品不可用（下架/404/重定向失效）: {url}")
-        return make_empty_record(url)
+        if redirect_info:
+            print(
+                f"  原 listing 已失效并重定向到新商品 {redirect_info['redirect_product_id']}，"
+                f"按原 ID 保存 existence=False"
+            )
+        else:
+            print(f"  商品不可用（下架/404）: {url}")
+        return make_empty_record(url, redirect_info=redirect_info)
 
     if not record.get("title") or record["title"] == "ERROR":
         print(f"  未提取到有效标题：{url}")
-        return make_empty_record(url)
+        return make_empty_record(url, redirect_info=redirect_info)
 
     validated, error = validate_product_record(record)
     if not validated:
