@@ -374,9 +374,19 @@ def build_redirect_info(original_url: str, final_url: str) -> dict[str, str] | N
 def format_redirect_summary(redirect_info: dict[str, str]) -> str:
     return (
         f"reason={redirect_info['reason']}; "
-        f"redirect_product_id={redirect_info['redirect_product_id']}; "
+        f"requested_url={redirect_info['original_url']}; "
+        f"requested_product_id={redirect_info['original_product_id']}; "
         f"final_url={redirect_info['final_url']}"
     )
+
+
+def apply_redirect_metadata(record: dict[str, Any], redirect_info: dict[str, str] | None) -> dict[str, Any]:
+    if not redirect_info:
+        return record
+    note = format_redirect_summary(redirect_info)
+    existing = str(record.get("summary") or "").strip()
+    record["summary"] = f"{existing}; {note}" if existing else note
+    return record
 
 
 def is_unavailable_product_page(
@@ -385,20 +395,13 @@ def is_unavailable_product_page(
     record: dict[str, Any],
     dom_data: dict[str, Any],
     page_text: str,
-    original_url: str,
-    final_url: str,
 ) -> bool:
-    """Detect delisted / 404 / redirect-to-other-product pages."""
+    """Detect delisted / 404 pages on the final rendered product page."""
     if api_data:
         api_result = _get_api_result(api_data)
         i18n = api_result.get("GLOBAL_DATA", {}).get("i18n", {}) or {}
         if i18n.get("ItemDetailResp", {}).get("PAGE_NOT_FOUND_NOTICE"):
             return True
-
-    original_pid = product_id_from_url(original_url)
-    final_pid = product_id_from_url(final_url)
-    if original_pid and final_pid and original_pid != final_pid:
-        return True
 
     lowered_page_text = str(page_text or "").lower()
     if any(marker in lowered_page_text for marker in NOT_FOUND_PAGE_MARKERS):
@@ -558,8 +561,8 @@ def make_empty_record(
     if redirect_info:
         summary = format_redirect_summary(redirect_info)
         description = (
-            "<p>Product unavailable. Original listing redirected to another product ID.</p>"
-            f"<p>Redirect product ID: {redirect_info['redirect_product_id']}</p>"
+            "<p>Product unavailable on redirected target page.</p>"
+            f"<p>Requested URL: {redirect_info['original_url']}</p>"
             f"<p>Final URL: {redirect_info['final_url']}</p>"
         )
     record = {
@@ -1525,42 +1528,42 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     # ---- 第六步：构建标准记录 ----
     final_url = page.url
     redirect_info = build_redirect_info(url, final_url)
+    save_url = redirect_info["final_url"] if redirect_info else url
     if redirect_info:
         print(
             f"  [重定向] product_id 变化: {redirect_info['original_product_id']} "
             f"-> {redirect_info['redirect_product_id']}"
         )
         print(f"  [重定向] 最终 URL: {redirect_info['final_url'][:160]}")
+        print("  [重定向] 将按最终 URL 的商品信息保存")
 
     page_text = await page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 8000) : ''")
-    record = build_standard_record(api_data, ld_json_list, dom_data, url)
+    record = build_standard_record(api_data, ld_json_list, dom_data, save_url)
 
     if is_unavailable_product_page(
         api_data=api_data,
         record=record,
         dom_data=dom_data,
         page_text=str(page_text or ""),
-        original_url=url,
-        final_url=final_url,
     ):
-        if redirect_info:
-            print(
-                f"  原 listing 已失效并重定向到新商品 {redirect_info['redirect_product_id']}，"
-                f"按原 ID 保存 existence=False"
-            )
-        else:
-            print(f"  商品不可用（下架/404）: {url}")
-        return make_empty_record(url, redirect_info=redirect_info)
+        print(f"  重定向目标页不可用（下架/404）: {save_url}")
+        return make_empty_record(save_url, redirect_info=redirect_info)
 
     if not record.get("title") or record["title"] == "ERROR":
-        print(f"  未提取到有效标题：{url}")
-        return make_empty_record(url, redirect_info=redirect_info)
+        print(f"  未提取到有效标题：{save_url}")
+        return make_empty_record(save_url, redirect_info=redirect_info)
 
     validated, error = validate_product_record(record)
     if not validated:
         print(f"  格式校验失败：{error}")
-        return make_empty_record(url)
+        return make_empty_record(save_url, redirect_info=redirect_info)
 
+    validated = apply_redirect_metadata(validated, redirect_info)
+    if redirect_info:
+        print(
+            f"  已按重定向商品保存: [{validated.get('source')}] {validated.get('product_id')} "
+            f"(原请求 {redirect_info['original_product_id']})"
+        )
     return validated
 
 

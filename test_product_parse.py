@@ -50,7 +50,7 @@ class ProductParseTestCase(unittest.TestCase):
             "aliexpress.us_123",
         )
 
-    def test_unavailable_product_detects_generic_title_and_redirect(self):
+    def test_unavailable_product_detects_generic_title(self):
         import importlib.util
 
         spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
@@ -71,11 +71,33 @@ class ProductParseTestCase(unittest.TestCase):
                 record=record,
                 dom_data={},
                 page_text="",
-                original_url=original,
-                final_url=redirected,
             )
         )
         self.assertTrue(mod.is_generic_page_title("Aliexpress"))
+
+    def test_redirect_alone_is_not_unavailable(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        original = "https://www.aliexpress.us/item/1005004506189269.html"
+        redirected = "https://www.aliexpress.us/item/3256804319874517.html"
+        record = {
+            "title": "Pet Grooming Brush",
+            "price": 12.99,
+            "images": "https://ae01.alicdn.com/kf/example.jpg",
+            "specifications": [{"name": "Material", "value": "Plastic"}],
+            "categories": "Pet Supplies",
+        }
+        self.assertFalse(
+            mod.is_unavailable_product_page(
+                api_data=None,
+                record=record,
+                dom_data={},
+                page_text="",
+            )
+        )
 
     def test_build_redirect_info(self):
         import importlib.util
@@ -88,12 +110,44 @@ class ProductParseTestCase(unittest.TestCase):
         info = mod.build_redirect_info(original, final)
         self.assertIsNotNone(info)
         self.assertEqual(info["redirect_product_id"], "3256804319874517")
-        record = mod.make_empty_record(original, redirect_info=info)
+        record = {
+            "date": "2026-07-01T10:00:00",
+            "url": final.split("?")[0],
+            "source": "aliexpress.us",
+            "product_id": "3256804319874517",
+            "existence": True,
+            "title": "Sample Product",
+            "description": "<p>Sample</p>",
+            "sku": "3256804319874517",
+            "images": mod.PLACEHOLDER_IMAGE,
+            "price": 9.99,
+            "currency": "USD",
+            "shipping_fee": 0,
+            "upc": None,
+            "brand": None,
+            "specifications": None,
+            "categories": None,
+            "options": None,
+            "variants": None,
+            "returnable": None,
+            "reviews": None,
+            "rating": None,
+            "sold_count": None,
+            "shipping_days_min": None,
+            "shipping_days_max": None,
+            "weight": None,
+            "width": None,
+            "height": None,
+            "length": None,
+            "has_only_default_variant": True,
+        }
+        record = mod.apply_redirect_metadata(record, info)
         validated, error = mod.validate_product_record(record)
         self.assertIsNone(error, msg=error)
-        self.assertFalse(validated["existence"])
-        self.assertIn("3256804319874517", validated["summary"])
-        self.assertIn("3256804319874517", validated["description"])
+        self.assertTrue(validated["existence"])
+        self.assertEqual(validated["product_id"], "3256804319874517")
+        self.assertIn("requested_url=", validated["summary"])
+        self.assertIn("1005004506189269", validated["summary"])
 
 
 if __name__ == "__main__":
