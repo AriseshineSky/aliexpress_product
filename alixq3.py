@@ -99,7 +99,8 @@ CAPTCHA_WAIT_SECONDS = 120
 CAPTCHA_MAX_ROUNDS = 30
 CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("CAPTCHA_RECOVERY_ROUNDS", "5") or "5")
 CAPTCHA_MANUAL_PAUSE_SECONDS = int(os.environ.get("CAPTCHA_MANUAL_PAUSE_SECONDS", "8") or "8")
-MAX_CAPTCHA_RESTARTS_PER_URL = 3
+MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("MAX_CAPTCHA_RESTARTS_PER_URL", "3") or "3")
+BROWSER_RESTART_DELAY_SECONDS = int(os.environ.get("BROWSER_RESTART_DELAY_SECONDS", "5") or "5")
 
 # 0 表示不限制；本地试跑可设 MAX_PRODUCTS=1
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0") or "0")
@@ -198,7 +199,15 @@ def webshare_proxy_label() -> str:
     if not proxy:
         return "未启用"
     username = proxy["username"]
-    return f"Webshare {WEBSHARE_HOST}:{WEBSHARE_PORT} (user={username})"
+    rotate_note = "，每次重启浏览器会建立新连接并轮换 IP" if username.endswith("-rotate") else ""
+    return f"Webshare {WEBSHARE_HOST}:{WEBSHARE_PORT} (user={username}){rotate_note}"
+
+
+def captcha_restart_label() -> str:
+    return (
+        f"单轮最多 {CAPTCHA_RECOVERY_ROUNDS} 次验证码尝试，"
+        f"单商品最多重启浏览器 {MAX_CAPTCHA_RESTARTS_PER_URL} 次"
+    )
 
 
 async def launch_browser_context(playwright, retries: int = 3):
@@ -2122,6 +2131,8 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
             print("  [API] 拦截到 mtop.aliexpress.pdp.pc.query 响应")
         else:
             print("  [API] 未拦截到有效 pdp 接口，降级使用 LD+JSON")
+    except BrowserRestartRequired:
+        raise
     except Exception as exc:
         print(f"  [API] 页面加载失败，降级使用 LD+JSON: {exc}")
 
@@ -2242,6 +2253,8 @@ async def main_async() -> None:
     print("浏览器模式: 无痕模式，不保存用户目录")
     print(f"浏览器代理: {webshare_proxy_label()}")
     print(f"xAI 验证码: {xai_config_label()}")
+    print(f"验证码重试: {captcha_restart_label()}")
+    print(f"浏览器重启等待: {BROWSER_RESTART_DELAY_SECONDS}s（重启前会清空 profile）")
     if MAX_PRODUCTS > 0:
         print(f"本地试跑: 最多处理 {MAX_PRODUCTS} 条商品")
     print()
@@ -2398,8 +2411,13 @@ async def main_async() -> None:
                     captcha_restart_counts[current_url] = captcha_restart_counts.get(current_url, 0) + 1
                     retry_count = captcha_restart_counts[current_url]
                     print(
-                        f"[主流程] {exc}，当前商品验证码重启 {retry_count}/"
+                        f"[主流程] {exc}，当前商品浏览器重启 {retry_count}/"
                         f"{MAX_CAPTCHA_RESTARTS_PER_URL}。"
+                    )
+                    print(
+                        f"[主流程] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重新启动浏览器"
+                        + ("（Webshare rotate 代理将分配新 IP）" if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate") else "")
+                        + "。"
                     )
                     if retry_count >= MAX_CAPTCHA_RESTARTS_PER_URL:
                         with invalid_path.open("a", encoding="utf-8") as invalid_fh:
@@ -2435,8 +2453,8 @@ async def main_async() -> None:
                     clear_browser_user_data()
 
                 if not batch_finished and current_index < len(links):
-                    print("[主流程] 等待 5 秒后重新启动浏览器。")
-                    await asyncio.sleep(5)
+                    print(f"[主流程] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
+                    await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
 
         if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
             break
