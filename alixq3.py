@@ -605,6 +605,69 @@ def make_empty_record(
     return validated if validated else record
 
 
+def make_superseded_record(redirect_info: dict[str, str]) -> dict[str, Any]:
+    """Mark the originally requested URL as no longer existing after redirect."""
+    original_url = redirect_info["original_url"]
+    pid = redirect_info["original_product_id"]
+    source = source_from_url(original_url)
+    target_pid = redirect_info["redirect_product_id"]
+    target_url = redirect_info["final_url"]
+    description = (
+        "<p>Original URL no longer exists.</p>"
+        f"<p>This listing was redirected to product ID {target_pid}.</p>"
+        f"<p>Redirect URL: {target_url}</p>"
+    )
+    summary = (
+        f"reason=original_url_no_longer_exists; status=superseded_by_redirect; "
+        f"redirect_product_id={target_pid}; redirect_url={target_url}"
+    )
+    record = {
+        "date": datetime.now().replace(microsecond=0).isoformat(),
+        "url": normalize_https_url(original_url),
+        "source": source,
+        "product_id": pid,
+        "existence": False,
+        "title": f"{MISSING_PRODUCT_TITLE_PREFIX} {pid}",
+        "title_en": None,
+        "description": description,
+        "summary": summary,
+        "sku": pid,
+        "upc": None,
+        "brand": None,
+        "specifications": None,
+        "categories": None,
+        "images": PLACEHOLDER_IMAGE,
+        "videos": None,
+        "price": 0.0,
+        "currency": "USD",
+        "available_qty": None,
+        "options": None,
+        "variants": None,
+        "returnable": None,
+        "reviews": None,
+        "rating": None,
+        "sold_count": None,
+        "shipping_fee": 0,
+        "shipping_days_min": None,
+        "shipping_days_max": None,
+        "weight": None,
+        "width": None,
+        "height": None,
+        "length": None,
+        "has_only_default_variant": True,
+        "_id": product_doc_id(source, pid),
+    }
+    validated, _ = validate_product_record(record)
+    return validated if validated else record
+
+
+def finalize_fetch_records(record: dict[str, Any], redirect_info: dict[str, str] | None) -> list[dict[str, Any]]:
+    records = [record]
+    if redirect_info:
+        records.append(make_superseded_record(redirect_info))
+    return records
+
+
 def _get_api_result(api_data: dict[str, Any] | None) -> dict[str, Any]:
     """从 API 数据中提取 result 字典"""
     if not api_data:
@@ -1477,8 +1540,8 @@ async def extract_product_description(page: Page) -> str:
         return ""
 
 
-async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) -> dict[str, Any] | None:
-    """打开产品页，拦截 MTOP API 获取数据，映射为标准 30 字段 Schema"""
+async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) -> list[dict[str, Any]]:
+    """打开产品页，拦截 MTOP API 获取数据，映射为标准 30 字段 Schema。"""
     full_url = url if "gatewayAdapt" in url else f"{url}?gatewayAdapt=glo2usa"
     api_data: dict[str, Any] | None = None
 
@@ -1547,16 +1610,16 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         page_text=str(page_text or ""),
     ):
         print(f"  重定向目标页不可用（下架/404）: {save_url}")
-        return make_empty_record(save_url, redirect_info=redirect_info)
+        return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
 
     if not record.get("title") or record["title"] == "ERROR":
         print(f"  未提取到有效标题：{save_url}")
-        return make_empty_record(save_url, redirect_info=redirect_info)
+        return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
 
     validated, error = validate_product_record(record)
     if not validated:
         print(f"  格式校验失败：{error}")
-        return make_empty_record(save_url, redirect_info=redirect_info)
+        return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
 
     validated = apply_redirect_metadata(validated, redirect_info)
     if redirect_info:
@@ -1564,7 +1627,11 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
             f"  已按重定向商品保存: [{validated.get('source')}] {validated.get('product_id')} "
             f"(原请求 {redirect_info['original_product_id']})"
         )
-    return validated
+        print(
+            f"  已标记原 URL 不存在: [{source_from_url(redirect_info['original_url'])}] "
+            f"{redirect_info['original_product_id']}"
+        )
+    return finalize_fetch_records(validated, redirect_info)
 
 
 async def main_async() -> None:
@@ -1653,53 +1720,63 @@ async def main_async() -> None:
 
                             print(f"[{index}/{total_links}] 第 {batch_no} 批 {current_index + 1}/{len(links)} 抓取详情: {url}")
                             try:
-                                product = await fetch_product(page, url, captcha_state)
-                                if not product:
-                                    product = make_empty_record(url)
+                                product_records = await fetch_product(page, url, captcha_state)
+                                if not product_records:
+                                    product_records = [make_empty_record(url)]
 
-                                validated, validation_error = validate_product_record(product)
-                                if not validated:
-                                    invalid_fh.write(
-                                        json.dumps(
-                                            {
-                                                "url": url,
-                                                "product_id": product_id_from_url(url),
-                                                "error": validation_error or "StandardProduct 校验失败",
-                                                "date": datetime.now().replace(microsecond=0).isoformat(),
-                                            },
-                                            ensure_ascii=False,
+                                saved_primary = False
+                                for record_idx, product in enumerate(product_records):
+                                    validated, validation_error = validate_product_record(product)
+                                    if not validated:
+                                        invalid_fh.write(
+                                            json.dumps(
+                                                {
+                                                    "url": url,
+                                                    "product_id": product_id_from_url(url),
+                                                    "error": validation_error or "StandardProduct 校验失败",
+                                                    "date": datetime.now().replace(microsecond=0).isoformat(),
+                                                },
+                                                ensure_ascii=False,
+                                            )
+                                            + "\n"
                                         )
-                                        + "\n"
-                                    )
-                                    invalid_fh.flush()
-                                    failed += 1
-                                    processed_urls.add(url)
-                                    save_progress(processed_urls)
-                                    current_index += 1
-                                    completed += 1
-                                    print(f"  失败: {validation_error}")
-                                    await sleep()
-                                    continue
+                                        invalid_fh.flush()
+                                        if record_idx == 0:
+                                            failed += 1
+                                        print(f"  失败: {validation_error}")
+                                        continue
 
-                                products_fh.write(json.dumps(validated, ensure_ascii=False) + "\n")
-                                products_fh.flush()
-                                upload_product(validated)
+                                    products_fh.write(json.dumps(validated, ensure_ascii=False) + "\n")
+                                    products_fh.flush()
+                                    upload_product(validated)
+                                    if record_idx == 0:
+                                        saved_primary = True
+                                        if validated.get("existence"):
+                                            success += 1
+                                            desc_len = len(str(validated.get("description") or ""))
+                                            print(
+                                                f"  成功: [{validated.get('source')}] {validated.get('product_id')} | "
+                                                f"{str(validated.get('title'))[:80]} | description={desc_len} chars"
+                                            )
+                                        else:
+                                            print(
+                                                f"  已保存不存在商品: [{validated.get('source')}] "
+                                                f"{validated.get('product_id')} | existence=False"
+                                            )
+                                    else:
+                                        print(
+                                            f"  已标记原 URL 不存在: [{validated.get('source')}] "
+                                            f"{validated.get('product_id')} | existence=False"
+                                        )
+
+                                if not saved_primary and product_records:
+                                    failed += 1
                                 processed_urls.add(url)
                                 save_progress(processed_urls)
                                 current_index += 1
                                 completed += 1
-                                if validated.get("existence"):
-                                    success += 1
-                                    desc_len = len(str(validated.get("description") or ""))
-                                    print(
-                                        f"  成功: [{validated.get('source')}] {validated.get('product_id')} | "
-                                        f"{str(validated.get('title'))[:80]} | description={desc_len} chars"
-                                    )
-                                else:
-                                    print(
-                                        f"  已保存不存在商品: [{validated.get('source')}] "
-                                        f"{validated.get('product_id')} | existence=False"
-                                    )
+                                await sleep()
+                                continue
                             except BrowserRestartRequired:
                                 raise
                             except Exception as exc:

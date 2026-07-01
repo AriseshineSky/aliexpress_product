@@ -149,6 +149,27 @@ class ProductParseTestCase(unittest.TestCase):
         self.assertIn("requested_url=", validated["summary"])
         self.assertIn("1005004506189269", validated["summary"])
 
+    def test_make_superseded_record_marks_original_url_unavailable(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        original = "https://www.aliexpress.us/item/1005004506189269.html"
+        final = "https://www.aliexpress.us/item/3256804319874517.html?gatewayAdapt=4itemAdapt"
+        info = mod.build_redirect_info(original, final)
+        superseded = mod.make_superseded_record(info)
+        validated, error = mod.validate_product_record(superseded)
+        self.assertIsNone(error, msg=error)
+        self.assertFalse(validated["existence"])
+        self.assertEqual(validated["product_id"], "1005004506189269")
+        self.assertEqual(validated["url"], "https://www.aliexpress.us/item/1005004506189269.html")
+        self.assertIn("original_url_no_longer_exists", validated["summary"])
+        self.assertIn("3256804319874517", validated["summary"])
+
+        records = mod.finalize_fetch_records({"product_id": "3256804319874517"}, info)
+        self.assertEqual(len(records), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
