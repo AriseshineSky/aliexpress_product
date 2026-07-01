@@ -356,27 +356,43 @@ def is_generic_page_title(title: str) -> bool:
 
 
 def build_redirect_info(original_url: str, final_url: str) -> dict[str, str] | None:
-    """Return redirect metadata when final page uses a different product_id."""
+    """Return redirect metadata when product_id or site (.com/.us) changes."""
     original_pid = product_id_from_url(original_url)
     final_pid = product_id_from_url(final_url)
-    if not original_pid or not final_pid or original_pid == final_pid:
+    original_source = source_from_url(original_url)
+    final_source = source_from_url(final_url)
+    if not original_pid or not final_pid:
         return None
+    if original_pid == final_pid and original_source == final_source:
+        return None
+
+    if original_pid != final_pid and original_source != final_source:
+        reason = "product_id_and_source_redirect"
+    elif original_source != final_source:
+        reason = "source_redirect"
+    else:
+        reason = "product_id_redirect"
+
     return {
-        "reason": "product_id_redirect",
+        "reason": reason,
         "original_product_id": original_pid,
         "redirect_product_id": final_pid,
+        "original_source": original_source,
+        "final_source": final_source,
         "original_url": normalize_https_url(original_url),
         "final_url": normalize_https_url(final_url),
-        "final_source": source_from_url(final_url),
     }
 
 
 def format_redirect_summary(redirect_info: dict[str, str]) -> str:
     return (
         f"reason={redirect_info['reason']}; "
+        f"requested_source={redirect_info['original_source']}; "
         f"requested_url={redirect_info['original_url']}; "
         f"requested_product_id={redirect_info['original_product_id']}; "
-        f"final_url={redirect_info['final_url']}"
+        f"final_source={redirect_info['final_source']}; "
+        f"final_url={redirect_info['final_url']}; "
+        f"final_product_id={redirect_info['redirect_product_id']}"
     )
 
 
@@ -609,16 +625,20 @@ def make_superseded_record(redirect_info: dict[str, str]) -> dict[str, Any]:
     """Mark the originally requested URL as no longer existing after redirect."""
     original_url = redirect_info["original_url"]
     pid = redirect_info["original_product_id"]
-    source = source_from_url(original_url)
+    source = redirect_info["original_source"]
     target_pid = redirect_info["redirect_product_id"]
     target_url = redirect_info["final_url"]
+    target_source = redirect_info["final_source"]
     description = (
         "<p>Original URL no longer exists.</p>"
-        f"<p>This listing was redirected to product ID {target_pid}.</p>"
+        f"<p>Requested site: {source}</p>"
+        f"<p>Redirect site: {target_source}</p>"
+        f"<p>Redirect product ID: {target_pid}</p>"
         f"<p>Redirect URL: {target_url}</p>"
     )
     summary = (
         f"reason=original_url_no_longer_exists; status=superseded_by_redirect; "
+        f"requested_source={source}; final_source={target_source}; "
         f"redirect_product_id={target_pid}; redirect_url={target_url}"
     )
     record = {
@@ -1593,10 +1613,17 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     redirect_info = build_redirect_info(url, final_url)
     save_url = redirect_info["final_url"] if redirect_info else url
     if redirect_info:
-        print(
-            f"  [重定向] product_id 变化: {redirect_info['original_product_id']} "
-            f"-> {redirect_info['redirect_product_id']}"
-        )
+        if redirect_info["original_product_id"] != redirect_info["redirect_product_id"]:
+            print(
+                f"  [重定向] product_id 变化: {redirect_info['original_product_id']} "
+                f"-> {redirect_info['redirect_product_id']}"
+            )
+        if redirect_info["original_source"] != redirect_info["final_source"]:
+            print(
+                f"  [重定向] 站点变化: {redirect_info['original_source']} "
+                f"-> {redirect_info['final_source']}"
+            )
+        print(f"  [重定向] 类型: {redirect_info['reason']}")
         print(f"  [重定向] 最终 URL: {redirect_info['final_url'][:160]}")
         print("  [重定向] 将按最终 URL 的商品信息保存")
 
@@ -1625,10 +1652,10 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     if redirect_info:
         print(
             f"  已按重定向商品保存: [{validated.get('source')}] {validated.get('product_id')} "
-            f"(原请求 {redirect_info['original_product_id']})"
+            f"(原请求 [{redirect_info['original_source']}] {redirect_info['original_product_id']})"
         )
         print(
-            f"  已标记原 URL 不存在: [{source_from_url(redirect_info['original_url'])}] "
+            f"  已标记原 URL 不存在: [{redirect_info['original_source']}] "
             f"{redirect_info['original_product_id']}"
         )
     return finalize_fetch_records(validated, redirect_info)

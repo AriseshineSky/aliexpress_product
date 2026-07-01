@@ -110,6 +110,9 @@ class ProductParseTestCase(unittest.TestCase):
         info = mod.build_redirect_info(original, final)
         self.assertIsNotNone(info)
         self.assertEqual(info["redirect_product_id"], "3256804319874517")
+        self.assertEqual(info["original_source"], "aliexpress.us")
+        self.assertEqual(info["final_source"], "aliexpress.us")
+        self.assertIn("requested_source=", mod.format_redirect_summary(info))
         record = {
             "date": "2026-07-01T10:00:00",
             "url": final.split("?")[0],
@@ -169,6 +172,29 @@ class ProductParseTestCase(unittest.TestCase):
 
         records = mod.finalize_fetch_records({"product_id": "3256804319874517"}, info)
         self.assertEqual(len(records), 2)
+
+    def test_build_redirect_info_for_com_to_us_same_product_id(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        original = "https://www.aliexpress.com/item/1005004506189269.html"
+        final = "https://www.aliexpress.us/item/1005004506189269.html?gatewayAdapt=glo2usa"
+        info = mod.build_redirect_info(original, final)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["reason"], "source_redirect")
+        self.assertEqual(info["original_source"], "aliexpress.com")
+        self.assertEqual(info["final_source"], "aliexpress.us")
+        self.assertEqual(info["original_product_id"], "1005004506189269")
+        self.assertEqual(info["redirect_product_id"], "1005004506189269")
+
+        superseded = mod.make_superseded_record(info)
+        validated, error = mod.validate_product_record(superseded)
+        self.assertIsNone(error, msg=error)
+        self.assertEqual(validated["_id"], "aliexpress.com_1005004506189269")
+        self.assertIn("aliexpress.com", validated["summary"])
+        self.assertIn("aliexpress.us", validated["summary"])
 
 
 if __name__ == "__main__":
