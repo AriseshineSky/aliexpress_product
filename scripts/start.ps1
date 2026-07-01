@@ -11,21 +11,21 @@ Set-Location $Root
 $venvPython = Join-Path $Root ".venv\Scripts\python.exe"
 
 if (-not (Test-Path $venvPython)) {
-    Write-Error @"
+    Write-Error @'
 .venv not found.
 
 Clone only downloads source code. Run the installer first:
-  scripts\install.bat
-"@
+  install.bat
+'@
 }
 
 if (-not (Test-Path ".env")) {
-    Write-Error @"
+    Write-Error @'
 .env not found.
 
 Copy .env.example to .env and fill in credentials:
   copy .env.example .env
-"@
+'@
 }
 
 $env:PYTHONUNBUFFERED = "1"

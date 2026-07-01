@@ -76,12 +76,12 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[4/4] Checking .env"
 if (-not (Test-Path ".env")) {
     Copy-Item ".env.example" ".env"
-    Write-Host "Created .env from .env.example — edit it with your credentials before running."
+    Write-Host 'Created .env from .env.example - edit it with your credentials before running.'
 } else {
-    Write-Host ".env already exists (not overwritten)."
+    Write-Host '.env already exists (not overwritten).'
 }
 
-Write-Host ""
-Write-Host "Install complete. Next steps:"
-Write-Host "  1. Edit .env with ES / Webshare credentials"
-Write-Host "  2. Run: scripts\start.bat"
+Write-Host ''
+Write-Host 'Install complete. Next steps:'
+Write-Host '  1. Edit .env with ES / Webshare credentials'
+Write-Host '  2. Run: start.bat'
