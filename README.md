@@ -1,0 +1,99 @@
+# AliExpress Product Crawler (alixq3)
+
+从 Elasticsearch 读取 AliExpress 商品链接，用 Playwright 抓取详情，校验 `StandardProduct` 格式后写入 ES 索引 `user1_aliexpress_us_products`。
+
+`.com` 与 `.us` 站点分开保存：`source` 为 `aliexpress.com` / `aliexpress.us`，文档 ID 为 `{source}_{product_id}`。
+
+## Windows 部署（Git + .env）
+
+### 1. 准备环境
+
+- Windows 10/11
+- [Git for Windows](https://git-scm.com/download/win)
+- Python 3.10+（安装时勾选 **Add Python to PATH**）
+- 可访问 ES 与 Webshare 代理的网络
+
+### 2. 克隆仓库
+
+```powershell
+git clone <你的仓库地址> aliexpress_product
+cd aliexpress_product
+```
+
+### 3. 配置敏感信息（不入库）
+
+```powershell
+copy .env.example .env
+notepad .env
+```
+
+必填项示例：
+
+```env
+ES_HOST=34.16.105.219
+ES_PORT=9200
+ES_USER=your_es_username
+ES_PASSWORD=your_es_password
+
+WEBSHARE_USER=your_webshare_username
+WEBSHARE_PASSWORD=your_webshare_password
+WEBSHARE_COUNTRY=US
+```
+
+**`.env` 已在 `.gitignore` 中，切勿提交到 Git。**
+
+### 4. 安装依赖
+
+双击或在 PowerShell 中运行：
+
+```powershell
+scripts\install.bat
+```
+
+脚本会：
+
+1. 创建 `.venv` 虚拟环境
+2. 安装 `requirements.txt`
+3. 安装 Playwright Chromium
+4. 若不存在 `.env`，从 `.env.example` 复制一份
+
+### 5. 运行抓取
+
+```powershell
+scripts\start.bat
+```
+
+输出目录：`产品详情/`（本地 jsonl + 进度文件）
+
+### 6. 更新代码
+
+```powershell
+git pull
+scripts\install.bat   # 依赖有变化时再跑
+scripts\start.bat
+```
+
+## 仓库里有什么 / 没有什么
+
+| 提交到 Git | 不提交（本地/机密） |
+|-----------|---------------------|
+| `alixq3.py`、`html_utils.py`、`em_product/` | `.env` |
+| `scripts/`、`requirements.txt` | `.venv/` |
+| `.env.example`（模板，无真实密码） | `产品详情/`、`browser_playwright/`、`img/` |
+
+## Linux 运行（参考）
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+cp .env.example .env   # 编辑后填入密钥
+PYTHONUNBUFFERED=1 python alixq3.py
+```
+
+## 测试
+
+```bash
+.venv\Scripts\python.exe -m unittest discover -s . -p test_product_parse.py -v
+```
