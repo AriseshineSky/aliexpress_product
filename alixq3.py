@@ -891,9 +891,32 @@ async def sleep(short: bool = False) -> None:
         low, high = max(300, low // 2), max(600, high // 2)
     await asyncio.sleep(random.randint(low, high) / 1000)
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "grok-4.3")
-OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "https://api.x.ai/v1/chat/completions")
+def resolve_xai_api_key() -> str:
+    """Read xAI API key from .env (XAI_API_KEY or OPENAI_API_KEY)."""
+    for name in ("XAI_API_KEY", "OPENAI_API_KEY"):
+        value = os.environ.get(name, "").strip().strip('"').strip("'")
+        if not value:
+            continue
+        lowered = value.lower()
+        if lowered.startswith("your_") or lowered in {"changeme", "none", "null"}:
+            continue
+        return value
+    return ""
+
+
+def resolve_xai_config() -> tuple[str, str, str, bool]:
+    api_key = resolve_xai_api_key()
+    model = os.environ.get("OPENAI_MODEL", os.environ.get("XAI_MODEL", "grok-4.3")).strip() or "grok-4.3"
+    api_base = os.environ.get(
+        "OPENAI_API_BASE",
+        os.environ.get("XAI_API_BASE", "https://api.x.ai/v1/chat/completions"),
+    ).strip()
+    auto_solve = os.environ.get("CAPTCHA_AUTO_SOLVE", "1").strip().lower() in ("1", "true", "yes", "on")
+    return api_key, model, api_base, auto_solve
+
+
+XAI_API_KEY, OPENAI_MODEL, OPENAI_API_BASE, CAPTCHA_AUTO_SOLVE = resolve_xai_config()
+OPENAI_API_KEY = XAI_API_KEY
 CAPTCHA_IMAGE_DIR = BASE_DIR / "img"
 
 OPENAI_PROMPT = """这是一张包含多个小图的验证码图片（通常是3x3的九宫格或4x4的十六宫格）。
@@ -1036,6 +1059,50 @@ async def wait_for_frame_with_locator(page: Page, selector: str, timeout_sec: in
         await asyncio.sleep(0.5)
     return None
 
+async def is_captcha_page_visible(page: Page) -> bool:
+    title = await page.title()
+    html = await page.content()
+    if is_captcha_text(title + "\n" + html):
+        return True
+    for frame in page.frames:
+        try:
+            if await frame.locator("#recaptcha-anchor > div.recaptcha-checkbox-border").count() > 0:
+                return True
+            if await frame.locator("#recaptcha-verify-button").count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def is_invalid_xai_key_error(response_text: str) -> bool:
+    lowered = str(response_text or "").lower()
+    return "incorrect api key" in lowered or "invalid api key" in lowered or "invalid-argument" in lowered and "api key" in lowered
+
+
+async def wait_for_manual_captcha(page: Page, timeout_sec: int = CAPTCHA_WAIT_SECONDS) -> bool:
+    print(
+        f"[验证码识别] 请在浏览器窗口中手动完成验证码（最多等待 {timeout_sec} 秒）..."
+    )
+    for elapsed in range(1, timeout_sec + 1):
+        if not await is_captcha_page_visible(page):
+            print("[验证码识别] 验证码已通过（手动）。")
+            return True
+        if elapsed in {1, 15, 30, 60, 90} or elapsed == timeout_sec:
+            print(f"[验证码识别] 仍在等待手动验证... {elapsed}/{timeout_sec}s")
+        await asyncio.sleep(1)
+    print("[验证码识别] 手动验证超时。")
+    return False
+
+
+def xai_config_label() -> str:
+    if not XAI_API_KEY:
+        return "未配置 XAI_API_KEY，遇到验证码时需手动完成"
+    masked = f"{XAI_API_KEY[:8]}...{XAI_API_KEY[-4:]}" if len(XAI_API_KEY) > 12 else "(已配置)"
+    mode = "自动识别" if CAPTCHA_AUTO_SOLVE else "仅手动"
+    return f"{mode} | model={OPENAI_MODEL} | key={masked}"
+
+
 async def solve_captcha(page: Page) -> bool:
     # 尝试寻找验证码 iframe
     checkbox_frame = None
@@ -1127,7 +1194,15 @@ async def solve_captcha(page: Page) -> bool:
                             print("[验证码识别] 验证码弹窗消失，验证可能已通过！")
                             return True
                     else:
-                        print(f"[验证码识别] 模型调用失败: {resp.text}")
+                        error_text = resp.text
+                        print(f"[验证码识别] 模型调用失败: {error_text}")
+                        if is_invalid_xai_key_error(error_text):
+                            print(
+                                "[验证码识别] xAI API Key 无效或未配置。"
+                                " 请在 .env 设置 XAI_API_KEY（从 https://console.x.ai 获取），"
+                                " 或设置 CAPTCHA_AUTO_SOLVE=0 改为纯手动验证。"
+                            )
+                            return await wait_for_manual_captcha(page)
                         return False
 
                 except Exception as e:
@@ -1141,25 +1216,31 @@ async def solve_captcha(page: Page) -> bool:
 
 
 async def handle_captcha(page: Page, captcha_state: dict[str, bool]) -> bool:
-    title = await page.title()
-    html = await page.content()
-    
-    if not is_captcha_text(title + "\\n" + html):
-        # 兜底判断是否有 recaptcha checkbox
-        has_checkbox = False
-        for f in page.frames:
-            if await f.locator("#recaptcha-anchor > div.recaptcha-checkbox-border").count() > 0:
-                has_checkbox = True
-                break
-        if not has_checkbox:
-            return False
+    if not await is_captcha_page_visible(page):
+        return False
 
-    print(f"\\n检测到验证/风控页面：{page.url}")
+    print(f"\n检测到验证/风控页面：{page.url}")
     if captcha_state.get("solved_once"):
         raise BrowserRestartRequired("爬取过程中再次检测到验证码，清空浏览器状态并重启")
 
+    if not XAI_API_KEY or not CAPTCHA_AUTO_SOLVE:
+        if not XAI_API_KEY:
+            print(
+                "[验证码识别] 未配置有效 XAI_API_KEY。"
+                " 请在 .env 设置 XAI_API_KEY=...（https://console.x.ai），当前等待手动验证。"
+            )
+        else:
+            print("[验证码识别] CAPTCHA_AUTO_SOLVE=0，跳过模型，等待手动验证。")
+        if await wait_for_manual_captcha(page):
+            captcha_state["solved_once"] = True
+            return True
+        raise BrowserRestartRequired("手动验证码超时，清空浏览器状态并重启")
+
     print("[验证码识别] 本轮浏览器第一次遇到验证码，先尝试自动解决。")
     if await solve_captcha(page):
+        captcha_state["solved_once"] = True
+        return True
+    if await wait_for_manual_captcha(page):
         captcha_state["solved_once"] = True
         return True
     raise BrowserRestartRequired("验证码自动解决失败，清空浏览器状态并重启")
@@ -1441,6 +1522,7 @@ async def main_async() -> None:
     print(f"详情输出目录: {OUTPUT_DIR}")
     print("浏览器模式: 无痕模式，不保存用户目录")
     print(f"浏览器代理: {webshare_proxy_label()}")
+    print(f"xAI 验证码: {xai_config_label()}")
     print()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
