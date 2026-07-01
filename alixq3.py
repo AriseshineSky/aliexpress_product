@@ -94,13 +94,13 @@ WEBSHARE_HOST = os.environ.get("WEBSHARE_HOST", "p.webshare.io").strip()
 WEBSHARE_PORT = os.environ.get("WEBSHARE_PORT", "80").strip()
 WEBSHARE_ROTATE = os.environ.get("WEBSHARE_ROTATE", "1").strip().lower() in ("1", "true", "yes", "on")
 
-HEADLESS = False
+HEADLESS = os.environ.get("HEADLESS", "0").strip().lower() in ("1", "true", "yes", "on")
 CAPTCHA_WAIT_SECONDS = 120
 CAPTCHA_MAX_ROUNDS = 30
 MAX_CAPTCHA_RESTARTS_PER_URL = 3
 
-# 0 表示不限制，抓完 ES 链接索引里的全部链接。
-MAX_PRODUCTS = 0
+# 0 表示不限制；本地试跑可设 MAX_PRODUCTS=1
+MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0") or "0")
 REQUEST_DELAY_MS = (2000, 4000)
 
 USER_AGENT = (
@@ -126,6 +126,15 @@ PROFILE_LOCK_FILES = (
 
 class BrowserRestartRequired(RuntimeError):
     pass
+
+
+def is_browser_closed_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "target page, context or browser has been closed" in message
+        or "browser has been closed" in message
+        or "connection closed" in message
+    )
 
 
 def cleanup_profile_locks(user_data_dir: Path) -> None:
@@ -1085,9 +1094,14 @@ async def wait_for_manual_captcha(page: Page, timeout_sec: int = CAPTCHA_WAIT_SE
         f"[验证码识别] 请在浏览器窗口中手动完成验证码（最多等待 {timeout_sec} 秒）..."
     )
     for elapsed in range(1, timeout_sec + 1):
-        if not await is_captcha_page_visible(page):
-            print("[验证码识别] 验证码已通过（手动）。")
-            return True
+        try:
+            if not await is_captcha_page_visible(page):
+                print("[验证码识别] 验证码已通过（手动）。")
+                return True
+        except Exception as exc:
+            if is_browser_closed_error(exc):
+                raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
+            raise
         if elapsed in {1, 15, 30, 60, 90} or elapsed == timeout_sec:
             print(f"[验证码识别] 仍在等待手动验证... {elapsed}/{timeout_sec}s")
         await asyncio.sleep(1)
@@ -1206,6 +1220,8 @@ async def solve_captcha(page: Page) -> bool:
                         return False
 
                 except Exception as e:
+                    if is_browser_closed_error(e):
+                        raise BrowserRestartRequired("浏览器已关闭，重新启动") from e
                     print(f"[验证码识别] 截图/交互失败: {e}")
                     return False
             else:
@@ -1523,6 +1539,8 @@ async def main_async() -> None:
     print("浏览器模式: 无痕模式，不保存用户目录")
     print(f"浏览器代理: {webshare_proxy_label()}")
     print(f"xAI 验证码: {xai_config_label()}")
+    if MAX_PRODUCTS > 0:
+        print(f"本地试跑: 最多处理 {MAX_PRODUCTS} 条商品")
     print()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1536,13 +1554,14 @@ async def main_async() -> None:
     success = 0
     failed = 0
     skipped = 0
+    completed = 0
     batch_no = 0
     fetched_count = 0
     search_after: list[Any] | None = None
     captcha_restart_counts: dict[str, int] = {}
 
     while True:
-        if MAX_PRODUCTS > 0 and success >= MAX_PRODUCTS:
+        if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
             break
         links, search_after = load_link_batch(search_after)
         if not links:
@@ -1558,7 +1577,7 @@ async def main_async() -> None:
         batch_finished = False
         async with async_playwright() as playwright:
             while current_index < len(links):
-                if MAX_PRODUCTS > 0 and success >= MAX_PRODUCTS:
+                if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
                     batch_finished = True
                     break
 
@@ -1573,7 +1592,7 @@ async def main_async() -> None:
                         "a", encoding="utf-8"
                     ) as invalid_fh:
                         while current_index < len(links):
-                            if MAX_PRODUCTS > 0 and success >= MAX_PRODUCTS:
+                            if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
                                 batch_finished = True
                                 break
 
@@ -1609,6 +1628,7 @@ async def main_async() -> None:
                                     processed_urls.add(url)
                                     save_progress(processed_urls)
                                     current_index += 1
+                                    completed += 1
                                     print(f"  失败: {validation_error}")
                                     await sleep()
                                     continue
@@ -1619,6 +1639,7 @@ async def main_async() -> None:
                                 processed_urls.add(url)
                                 save_progress(processed_urls)
                                 current_index += 1
+                                completed += 1
                                 if validated.get("existence"):
                                     success += 1
                                     desc_len = len(str(validated.get("description") or ""))
@@ -1634,6 +1655,8 @@ async def main_async() -> None:
                             except BrowserRestartRequired:
                                 raise
                             except Exception as exc:
+                                if is_browser_closed_error(exc):
+                                    raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
                                 failed += 1
                                 invalid_fh.write(
                                     json.dumps(
@@ -1651,6 +1674,7 @@ async def main_async() -> None:
                                 processed_urls.add(url)
                                 save_progress(processed_urls)
                                 current_index += 1
+                                completed += 1
                                 print(f"  失败: {exc}")
 
                             await sleep()
@@ -1682,6 +1706,7 @@ async def main_async() -> None:
                         processed_urls.add(current_url)
                         save_progress(processed_urls)
                         current_index += 1
+                        completed += 1
                         print("[主流程] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
                 finally:
                     if context:
@@ -1700,13 +1725,14 @@ async def main_async() -> None:
                     print("[主流程] 等待 5 秒后重新启动浏览器。")
                     await asyncio.sleep(5)
 
-        if MAX_PRODUCTS > 0 and success >= MAX_PRODUCTS:
+        if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
             break
         print(f"[ES链接] 第 {batch_no} 批处理完成，准备读取下一批。")
 
     print("\n完成。")
     print(f"成功: {success}")
     print(f"失败: {failed}")
+    print(f"已完成: {completed}")
     print(f"跳过已处理: {skipped}")
     print(f"详情文件: {products_path}")
     print(f"失败文件: {invalid_path}")
