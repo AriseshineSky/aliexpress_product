@@ -15,7 +15,7 @@ from datetime import datetime
 from html import unescape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
@@ -41,10 +41,48 @@ PROGRESS_FILE = OUTPUT_DIR / "alixq_progress.json"
 PRODUCTS_FILE = OUTPUT_DIR / "products.jsonl"
 INVALID_FILE = OUTPUT_DIR / "invalid.jsonl"
 
-ES_HOST = os.environ.get("ES_HOST", "34.16.105.219")
-ES_PORT = os.environ.get("ES_PORT", "9200")
-ES_USER = os.environ.get("ES_USER", "").strip()
-ES_PASSWORD = os.environ.get("ES_PASSWORD", "").strip()
+def resolve_es_config() -> tuple[str, str, str, str]:
+    """Read ES settings from .env (supports ES_* and ELASTICSEARCH_URL)."""
+    host = os.environ.get("ES_HOST", "").strip()
+    port = os.environ.get("ES_PORT", "").strip()
+    user = os.environ.get("ES_USER", "").strip()
+    password = os.environ.get("ES_PASSWORD", "").strip()
+
+    es_url = os.environ.get("ELASTICSEARCH_URL", "").strip()
+    if es_url:
+        parsed = urlparse(es_url)
+        if not host and parsed.hostname:
+            host = parsed.hostname
+        if not port:
+            port = str(parsed.port or 9200)
+        if not user and parsed.username:
+            user = unquote(parsed.username)
+        if not password and parsed.password:
+            password = unquote(parsed.password)
+
+    if not user:
+        user = os.environ.get("ELASTICSEARCH_USERNAME", "").strip()
+    if not password:
+        password = os.environ.get("ELASTICSEARCH_PASSWORD", "").strip()
+
+    servers = os.environ.get("ELASTICSEARCH_SERVERS", "").strip()
+    if servers and not host:
+        if ":" in servers:
+            host, port_part = servers.rsplit(":", 1)
+            if not port:
+                port = port_part
+        else:
+            host = servers
+
+    if not host:
+        host = "34.16.105.219"
+    if not port:
+        port = "9200"
+
+    return host, port, user, password
+
+
+ES_HOST, ES_PORT, ES_USER, ES_PASSWORD = resolve_es_config()
 URLS_INDEX_NAME = "user1_aliexpress_us_product_urls"
 PRODUCT_INDEX_NAME = os.environ.get("PRODUCT_INDEX_NAME", "user1_aliexpress_us_products")
 URLS_BATCH_SIZE = 1000
@@ -1317,6 +1355,16 @@ async def main_async() -> None:
     print("=" * 60)
     print(f"链接来源: http://{ES_HOST}:{ES_PORT}/{URLS_INDEX_NAME}")
     print(f"上传索引: {PRODUCT_INDEX_NAME}")
+    print(f"ES 用户: {ES_USER or '(未设置)'}")
+    if not ES_USER or not ES_PASSWORD:
+        print()
+        print("错误: Elasticsearch 认证未配置。")
+        print("请在 .env 中设置以下任一方式：")
+        print("  ES_USER=emuser1")
+        print("  ES_PASSWORD=your_password")
+        print("或一行 URL：")
+        print("  ELASTICSEARCH_URL=http://emuser1:your_password@34.16.105.219:9200")
+        raise SystemExit(1)
     print(f"详情输出目录: {OUTPUT_DIR}")
     print("浏览器模式: 无痕模式，不保存用户目录")
     print(f"浏览器代理: {webshare_proxy_label()}")
