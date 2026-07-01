@@ -97,6 +97,8 @@ WEBSHARE_ROTATE = os.environ.get("WEBSHARE_ROTATE", "1").strip().lower() in ("1"
 HEADLESS = os.environ.get("HEADLESS", "0").strip().lower() in ("1", "true", "yes", "on")
 CAPTCHA_WAIT_SECONDS = 120
 CAPTCHA_MAX_ROUNDS = 30
+CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("CAPTCHA_RECOVERY_ROUNDS", "5") or "5")
+CAPTCHA_MANUAL_PAUSE_SECONDS = int(os.environ.get("CAPTCHA_MANUAL_PAUSE_SECONDS", "8") or "8")
 MAX_CAPTCHA_RESTARTS_PER_URL = 3
 
 # 0 表示不限制；本地试跑可设 MAX_PRODUCTS=1
@@ -989,7 +991,7 @@ async def navigate_product_page(page: Page, full_url: str, captcha_state: dict[s
     for attempt in range(1, 4):
         await page.goto(full_url, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_timeout(2500)
-        await handle_captcha(page, captcha_state)
+        await handle_captcha(page, captcha_state, product_url=full_url)
         await sleep(short=True)
         if not is_blocked_url(page.url):
             return
@@ -1240,7 +1242,84 @@ def xai_config_label() -> str:
     return f"{mode} | model={OPENAI_MODEL} | key={masked}"
 
 
-async def solve_captcha(page: Page) -> bool:
+async def is_product_page_ready(page: Page) -> bool:
+    if is_blocked_url(page.url):
+        return False
+    try:
+        title = await page.evaluate(
+            """() => {
+              const el = document.querySelector('h1, [data-pl="product-title"]');
+              return el ? (el.innerText || '').trim() : '';
+            }"""
+        )
+        return bool(title) and not is_generic_page_title(str(title))
+    except Exception:
+        return False
+
+
+async def close_captcha_popup(page: Page) -> None:
+    print("[验证码识别] 尝试关闭验证码弹窗...")
+    try:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.4)
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+    for selector in (
+        '[aria-label="Close"]',
+        'button[aria-label="close"]',
+        '.next-dialog-close',
+        '.comet-modal-close',
+        '.btn-close',
+        '.close-btn',
+    ):
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() > 0 and await locator.is_visible():
+                await locator.click(timeout=2000)
+                await asyncio.sleep(0.4)
+        except Exception:
+            continue
+
+    try:
+        await page.evaluate(
+            """() => {
+              const hide = (el) => {
+                if (!el) return;
+                el.style.setProperty('display', 'none', 'important');
+                el.style.setProperty('visibility', 'hidden', 'important');
+              };
+              document.querySelectorAll(
+                'iframe[title*="recaptcha challenge"], iframe[src*="recaptcha/api2/bframe"]'
+              ).forEach((frame) => hide(frame.closest('div') || frame));
+              document.querySelectorAll('.g-recaptcha-bubble-arrow, #rc-imageselect').forEach(hide);
+              document.querySelectorAll('div').forEach((el) => {
+                const iframe = el.querySelector('iframe[src*="recaptcha"]');
+                if (!iframe) return;
+                const z = parseInt(window.getComputedStyle(el).zIndex || '0', 10);
+                if (z >= 200) hide(el);
+              });
+            }"""
+        )
+    except Exception as exc:
+        if is_browser_closed_error(exc):
+            raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
+
+
+async def refresh_after_captcha(page: Page, product_url: str) -> None:
+    print(f"[验证码识别] 刷新页面: {product_url[:120]}")
+    await page.goto(product_url, wait_until="domcontentloaded", timeout=90000)
+    await page.wait_for_timeout(2500)
+
+
+async def captcha_cleared_after_refresh(page: Page) -> bool:
+    if await is_product_page_ready(page):
+        return True
+    return not await is_captcha_page_visible(page)
+
+
+async def solve_captcha(page: Page, max_rounds: int = CAPTCHA_MAX_ROUNDS) -> bool:
     # 尝试寻找验证码 iframe
     checkbox_frame = None
     for _ in range(10):
@@ -1263,9 +1342,9 @@ async def solve_captcha(page: Page) -> bool:
             print(f"[验证码识别] 点击 checkbox 失败: {e}")
 
         retry_count = 0
-        while retry_count < CAPTCHA_MAX_ROUNDS:
+        while retry_count < max_rounds:
             retry_count += 1
-            print(f"[验证码识别] 等待图片弹窗加载... ({retry_count}/{CAPTCHA_MAX_ROUNDS})")
+            print(f"[验证码识别] 等待图片弹窗加载... ({retry_count}/{max_rounds})")
             await asyncio.sleep(2)
             images_frame = await wait_for_frame_with_locator(page, "#recaptcha-verify-button", timeout_sec=10)
 
@@ -1339,7 +1418,7 @@ async def solve_captcha(page: Page) -> bool:
                                 " 请在 .env 设置 XAI_API_KEY（从 https://console.x.ai 获取），"
                                 " 或设置 CAPTCHA_AUTO_SOLVE=0 改为纯手动验证。"
                             )
-                            return await wait_for_manual_captcha(page)
+                            return False
                         return False
 
                 except Exception as e:
@@ -1354,35 +1433,60 @@ async def solve_captcha(page: Page) -> bool:
     return True
 
 
-async def handle_captcha(page: Page, captcha_state: dict[str, bool]) -> bool:
+async def handle_captcha(
+    page: Page,
+    captcha_state: dict[str, bool],
+    product_url: str | None = None,
+) -> bool:
+    if await is_product_page_ready(page):
+        return False
     if not await is_captcha_page_visible(page):
         return False
 
+    target_url = product_url or page.url
     print(f"\n检测到验证/风控页面：{page.url}")
     if captcha_state.get("solved_once"):
         raise BrowserRestartRequired("爬取过程中再次检测到验证码，清空浏览器状态并重启")
 
-    if not XAI_API_KEY or not CAPTCHA_AUTO_SOLVE:
-        if not XAI_API_KEY:
-            print(
-                "[验证码识别] 未配置有效 XAI_API_KEY。"
-                " 请在 .env 设置 XAI_API_KEY=...（https://console.x.ai），当前等待手动验证。"
-            )
+    for attempt in range(1, CAPTCHA_RECOVERY_ROUNDS + 1):
+        if await captcha_cleared_after_refresh(page):
+            return False
+
+        print(f"[验证码识别] 第 {attempt}/{CAPTCHA_RECOVERY_ROUNDS} 轮：尝试通过验证码...")
+
+        if XAI_API_KEY and CAPTCHA_AUTO_SOLVE:
+            print("[验证码识别] 自动识别验证码（单轮）。")
+            await solve_captcha(page, max_rounds=1)
         else:
-            print("[验证码识别] CAPTCHA_AUTO_SOLVE=0，跳过模型，等待手动验证。")
-        if await wait_for_manual_captcha(page):
+            if not XAI_API_KEY:
+                print(
+                    "[验证码识别] 未配置 XAI_API_KEY，"
+                    f"等待 {CAPTCHA_MANUAL_PAUSE_SECONDS}s 以便手动处理..."
+                )
+            else:
+                print(
+                    f"[验证码识别] CAPTCHA_AUTO_SOLVE=0，"
+                    f"等待 {CAPTCHA_MANUAL_PAUSE_SECONDS}s 以便手动处理..."
+                )
+            await asyncio.sleep(CAPTCHA_MANUAL_PAUSE_SECONDS)
+
+        await close_captcha_popup(page)
+        await refresh_after_captcha(page, target_url)
+        await sleep(short=True)
+
+        if await captcha_cleared_after_refresh(page):
+            print("[验证码识别] 关闭弹窗并刷新后，商品页已可继续抓取。")
             captcha_state["solved_once"] = True
             return True
-        raise BrowserRestartRequired("手动验证码超时，清空浏览器状态并重启")
 
-    print("[验证码识别] 本轮浏览器第一次遇到验证码，先尝试自动解决。")
-    if await solve_captcha(page):
-        captcha_state["solved_once"] = True
-        return True
-    if await wait_for_manual_captcha(page):
-        captcha_state["solved_once"] = True
-        return True
-    raise BrowserRestartRequired("验证码自动解决失败，清空浏览器状态并重启")
+        if await is_captcha_page_visible(page):
+            print("[验证码识别] 刷新后仍有验证码，继续下一轮...")
+        else:
+            print("[验证码识别] 刷新后页面状态未完全确认，继续下一轮...")
+
+    raise BrowserRestartRequired(
+        f"验证码处理 {CAPTCHA_RECOVERY_ROUNDS} 轮后仍未进入商品页，清空浏览器状态并重启"
+    )
 
 async def extract_ld_json(page: Page) -> list[dict[str, Any]]:
     """从页面提取所有 LD+JSON 结构化数据，自动展平嵌套数组"""
@@ -1572,7 +1676,7 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         ) as response_info:
             await page.goto(full_url, wait_until="domcontentloaded", timeout=90000)
             await page.wait_for_timeout(2500)
-            await handle_captcha(page, captcha_state)
+            await handle_captcha(page, captcha_state, product_url=full_url)
             await sleep(short=True)
             try:
                 response = await response_info.value
@@ -1584,7 +1688,7 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     except PlaywrightTimeoutError:
         await page.goto(full_url, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_timeout(2500)
-        await handle_captcha(page, captcha_state)
+        await handle_captcha(page, captcha_state, product_url=full_url)
         await sleep(short=True)
         print("  [API] 未在 90s 内拦截到 pdp 接口，降级使用 LD+JSON")
 
