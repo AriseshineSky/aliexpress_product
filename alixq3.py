@@ -1312,6 +1312,30 @@ def is_blocked_url(url: str) -> bool:
     return "punish" in lowered or "tmd" in lowered
 
 
+async def is_risk_control_page(page: Page) -> bool:
+    """仍在风控/验证码流程中的页面，不应保存商品数据。"""
+    if is_blocked_url(page.url):
+        return True
+    try:
+        if await is_captcha_page_visible(page):
+            return True
+        title = await page.title()
+        page_text = await page.evaluate(
+            "() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 4000) : ''"
+        )
+        if is_captcha_text(f"{title}\n{page_text}"):
+            return True
+    except Exception as exc:
+        if is_browser_closed_error(exc):
+            raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
+    return False
+
+
+async def raise_if_risk_control_page(page: Page) -> None:
+    if await is_risk_control_page(page):
+        raise BrowserRestartRequired("页面仍在风控/验证状态，不保存商品数据")
+
+
 async def navigate_product_page(page: Page, full_url: str, captcha_state: dict[str, bool]) -> None:
     """打开商品页并在风控页时重试导航，直到进入正常商品页或达到重试上限。"""
     for attempt in range(1, 4):
@@ -1834,7 +1858,11 @@ async def handle_captcha(
     target_url = product_url or page.url
     print(f"\n检测到验证/风控页面：{page.url}")
     if captcha_state.get("solved_once"):
-        raise BrowserRestartRequired("爬取过程中再次检测到验证码，清空浏览器状态并重启")
+        captcha_state["session_captcha_count"] = captcha_state.get("session_captcha_count", 1) + 1
+        print(
+            f"[验证码识别] 会话中再次出现验证码（第 {captcha_state['session_captcha_count']} 次），"
+            "继续尝试自动处理..."
+        )
 
     for attempt in range(1, CAPTCHA_RECOVERY_ROUNDS + 1):
         if await captcha_cleared_after_refresh(page):
@@ -1865,6 +1893,7 @@ async def handle_captcha(
         if await captcha_cleared_after_refresh(page):
             print("[验证码识别] 关闭弹窗并刷新后，商品页已可继续抓取。")
             captcha_state["solved_once"] = True
+            captcha_state.setdefault("session_captcha_count", 1)
             return True
 
         if await is_captcha_page_visible(page):
@@ -2155,6 +2184,8 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         print("  [重定向] 将按最终 URL 的商品信息保存")
 
     page_text = await page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 8000) : ''")
+    await raise_if_risk_control_page(page)
+
     record = build_standard_record(api_data, ld_json_list, dom_data, save_url)
 
     if is_unavailable_product_page(
@@ -2163,15 +2194,18 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         dom_data=dom_data,
         page_text=str(page_text or ""),
     ):
+        await raise_if_risk_control_page(page)
         print(f"  重定向目标页不可用（下架/404）: {save_url}")
         return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
 
     if not record.get("title") or record["title"] == "ERROR":
+        await raise_if_risk_control_page(page)
         print(f"  未提取到有效标题：{save_url}")
         return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
 
     validated, error = validate_product_record(record)
     if not validated:
+        await raise_if_risk_control_page(page)
         print(f"  格式校验失败：{error}")
         return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
 
@@ -2276,7 +2310,7 @@ async def main_async() -> None:
                             try:
                                 product_records = await fetch_product(page, url, captcha_state)
                                 if not product_records:
-                                    product_records = [make_empty_record(url)]
+                                    raise BrowserRestartRequired("未获取到商品数据，不保存")
 
                                 saved_primary = False
                                 for record_idx, product in enumerate(product_records):

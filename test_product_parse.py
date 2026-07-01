@@ -50,6 +50,26 @@ class ProductParseTestCase(unittest.TestCase):
             "aliexpress.us_123",
         )
 
+    def test_is_blocked_url_detects_punish_pages(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(mod.is_blocked_url("https://www.aliexpress.com/_____tmd_____/punish?x=1"))
+        self.assertTrue(mod.is_blocked_url("https://example.com/punish/redirect"))
+        self.assertFalse(mod.is_blocked_url("https://www.aliexpress.com/item/1005001281271984.html"))
+
+    def test_captcha_text_detects_security_pages(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(mod.is_captcha_text("Please complete the security check"))
+        self.assertTrue(mod.is_captcha_text("Unusual traffic from your network"))
+        self.assertFalse(mod.is_captcha_text("Pet Grooming Brush for dogs"))
+
     def test_unavailable_product_detects_generic_title(self):
         import importlib.util
 
