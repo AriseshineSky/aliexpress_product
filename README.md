@@ -4,6 +4,15 @@
 
 `.com` 与 `.us` 站点分开保存：`source` 为 `aliexpress.com` / `aliexpress.us`，文档 ID 为 `{source}_{product_id}`。
 
+## 一键启动（直接运行）
+
+| 平台 | 首次安装 | 启动抓取 |
+|------|----------|----------|
+| **Windows** | 双击或运行 `install.bat` | 双击或运行 `start.bat` |
+| **Linux / macOS** | `./install.sh` | `./start.sh` |
+
+等价命令也在 `scripts/` 目录：`scripts\start.bat`（Windows）、`scripts/start.sh`（Linux）。
+
 ## Windows 部署（Git + .env）
 
 ### 1. 准备环境
@@ -59,8 +68,10 @@ scripts\install.bat
 
 ### 5. 运行抓取
 
+双击项目根目录的 `start.bat`，或在 PowerShell 中：
+
 ```powershell
-scripts\start.bat
+start.bat
 ```
 
 输出目录：`产品详情/`（本地 jsonl + 进度文件）
@@ -81,15 +92,11 @@ scripts\start.bat
 | `scripts/`、`requirements.txt` | `.venv/` |
 | `.env.example`（模板，无真实密码） | `产品详情/`、`browser_playwright/`、`img/` |
 
-## Linux 运行（参考）
+## Linux 运行
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-cp .env.example .env   # 编辑后填入密钥
-PYTHONUNBUFFERED=1 python alixq3.py
+./install.sh    # 首次
+./start.sh      # 启动抓取
 ```
 
 ## 测试
