@@ -2389,6 +2389,24 @@ class CrawlState:
 UrlTask = tuple[str, int, int, int, int]
 
 
+async def close_browser_session(
+    browser,
+    context,
+    worker_id: int,
+) -> None:
+    if context:
+        try:
+            await asyncio.wait_for(context.close(), timeout=8)
+        except Exception:
+            pass
+    if browser:
+        try:
+            await asyncio.wait_for(browser.close(), timeout=8)
+        except Exception:
+            pass
+    clear_browser_user_data(worker_id)
+
+
 async def browser_worker(
     worker_id: int,
     state: CrawlState,
@@ -2409,6 +2427,7 @@ async def browser_worker(
 
         browser = None
         context = None
+        reset_after_product = False
         try:
             browser, context, page = await launch_browser_context(playwright, worker_id=worker_id)
             print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
@@ -2445,8 +2464,9 @@ async def browser_worker(
                     await state.finish_url(url)
                     task_queue.task_done()
                     pending_task = None
+                    reset_after_product = True
                     await sleep()
-                    continue
+                    break
                 except BrowserRestartRequired:
                     raise
                 except Exception as exc:
@@ -2465,8 +2485,10 @@ async def browser_worker(
                     await state.finish_url(url)
                     task_queue.task_done()
                     pending_task = None
+                    reset_after_product = True
                     print(f"  失败: {exc}")
                     await sleep()
+                    break
         except BrowserRestartRequired as exc:
             if pending_task is None:
                 continue
@@ -2503,21 +2525,24 @@ async def browser_worker(
                 pending_task = None
                 print(f"[{worker_label}] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
         finally:
-            if context:
-                try:
-                    await asyncio.wait_for(context.close(), timeout=8)
-                except Exception:
-                    pass
-            if browser:
-                try:
-                    await asyncio.wait_for(browser.close(), timeout=8)
-                except Exception:
-                    pass
-            if worker_id is not None:
-                clear_browser_user_data(worker_id)
+            await close_browser_session(browser, context, worker_id)
 
-        if pending_task is not None and not await state.should_stop():
+        if await state.should_stop():
+            break
+
+        if pending_task is not None:
             print(f"[{worker_label}] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
+            await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+        elif reset_after_product:
+            rotate_note = (
+                "（Webshare rotate 代理将分配新 IP）"
+                if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
+                else ""
+            )
+            print(
+                f"[{worker_label}] 当前商品已处理完毕，已重置浏览器，"
+                f"{BROWSER_RESTART_DELAY_SECONDS}s 后启动新会话{rotate_note}。"
+            )
             await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
 
     print(f"[{worker_label}] 结束")
