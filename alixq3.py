@@ -101,6 +101,7 @@ CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("CAPTCHA_RECOVERY_ROUNDS", "5") or 
 CAPTCHA_MANUAL_PAUSE_SECONDS = int(os.environ.get("CAPTCHA_MANUAL_PAUSE_SECONDS", "8") or "8")
 MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("MAX_CAPTCHA_RESTARTS_PER_URL", "3") or "3")
 BROWSER_RESTART_DELAY_SECONDS = int(os.environ.get("BROWSER_RESTART_DELAY_SECONDS", "5") or "5")
+WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
 
 # 0 表示不限制；本地试跑可设 MAX_PRODUCTS=1
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0") or "0")
@@ -156,8 +157,24 @@ def cleanup_profile_locks(user_data_dir: Path) -> None:
                 pass
 
 
-def clear_browser_user_data() -> None:
-    cleanup_profile_locks(USER_DATA_DIR)
+def worker_user_data_dir(worker_id: int = 0) -> Path:
+    if WORKER_COUNT <= 1:
+        return USER_DATA_DIR
+    return USER_DATA_DIR / f"worker_{worker_id}"
+
+
+def clear_browser_user_data(worker_id: int | None = None) -> None:
+    if worker_id is not None:
+        user_data_dir = worker_user_data_dir(worker_id)
+        cleanup_profile_locks(user_data_dir)
+        if user_data_dir.exists():
+            shutil.rmtree(user_data_dir, ignore_errors=True)
+        return
+
+    if WORKER_COUNT <= 1:
+        clear_browser_user_data(0)
+        return
+
     if USER_DATA_DIR.exists():
         shutil.rmtree(USER_DATA_DIR, ignore_errors=True)
 
@@ -210,15 +227,30 @@ def captcha_restart_label() -> str:
     )
 
 
-async def launch_browser_context(playwright, retries: int = 3):
+def build_chromium_args(worker_id: int = 0) -> list[str]:
+    args = list(CHROMIUM_ARGS)
+    if not HEADLESS and WORKER_COUNT > 1:
+        cols = min(WORKER_COUNT, 3)
+        row = worker_id // cols
+        col = worker_id % cols
+        args.extend(
+            [
+                f"--window-position={col * 680},{row * 420}",
+                "--window-size=640,400",
+            ]
+        )
+    return args
+
+
+async def launch_browser_context(playwright, worker_id: int = 0, retries: int = 3):
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
-        clear_browser_user_data()
+        clear_browser_user_data(worker_id)
         try:
             proxy = build_webshare_proxy()
             launch_kwargs: dict[str, Any] = {
                 "headless": HEADLESS,
-                "args": CHROMIUM_ARGS,
+                "args": build_chromium_args(worker_id),
                 "ignore_default_args": ["--enable-automation"],
             }
             if proxy:
@@ -2233,6 +2265,296 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     return finalize_fetch_records(validated, redirect_info)
 
 
+class CrawlState:
+    def __init__(self, processed_urls: set[str]):
+        self.processed_urls = processed_urls
+        self.in_progress: set[str] = set()
+        self.lock = asyncio.Lock()
+        self.file_lock = asyncio.Lock()
+        self.stats_lock = asyncio.Lock()
+        self.success = 0
+        self.failed = 0
+        self.skipped = 0
+        self.completed = 0
+
+    async def is_processed(self, url: str) -> bool:
+        async with self.lock:
+            return url in self.processed_urls or url in self.in_progress
+
+    async def claim_url(self, url: str) -> bool:
+        async with self.lock:
+            if url in self.processed_urls or url in self.in_progress:
+                return False
+            self.in_progress.add(url)
+            return True
+
+    async def release_url(self, url: str) -> None:
+        async with self.lock:
+            self.in_progress.discard(url)
+
+    async def finish_url(self, url: str) -> None:
+        async with self.lock:
+            self.in_progress.discard(url)
+            self.processed_urls.add(url)
+            save_progress(self.processed_urls)
+
+    async def mark_skipped(self) -> None:
+        async with self.stats_lock:
+            self.skipped += 1
+
+    async def mark_url_done(self, *, success: bool = False, failed: bool = False) -> None:
+        async with self.stats_lock:
+            self.completed += 1
+            if success:
+                self.success += 1
+            if failed:
+                self.failed += 1
+
+    async def should_stop(self) -> bool:
+        if MAX_PRODUCTS <= 0:
+            return False
+        async with self.stats_lock:
+            return self.completed >= MAX_PRODUCTS
+
+    async def append_invalid(self, invalid_path: Path, payload: dict[str, Any]) -> None:
+        async with self.file_lock:
+            with invalid_path.open("a", encoding="utf-8") as invalid_fh:
+                invalid_fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                invalid_fh.flush()
+
+    async def save_product_records(
+        self,
+        products_path: Path,
+        invalid_path: Path,
+        url: str,
+        product_records: list[dict[str, Any]],
+    ) -> None:
+        saved_primary = False
+        primary_success = False
+        primary_failed = False
+        async with self.file_lock:
+            with products_path.open("a", encoding="utf-8") as products_fh, invalid_path.open(
+                "a", encoding="utf-8"
+            ) as invalid_fh:
+                for record_idx, product in enumerate(product_records):
+                    validated, validation_error = validate_product_record(product)
+                    if not validated:
+                        invalid_fh.write(
+                            json.dumps(
+                                {
+                                    "url": url,
+                                    "product_id": product_id_from_url(url),
+                                    "error": validation_error or "StandardProduct 校验失败",
+                                    "date": datetime.now().replace(microsecond=0).isoformat(),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        invalid_fh.flush()
+                        if record_idx == 0:
+                            primary_failed = True
+                        print(f"  失败: {validation_error}")
+                        continue
+
+                    products_fh.write(json.dumps(validated, ensure_ascii=False) + "\n")
+                    products_fh.flush()
+                    upload_product(validated)
+                    if record_idx == 0:
+                        saved_primary = True
+                        primary_success = bool(validated.get("existence"))
+                        if primary_success:
+                            desc_len = len(str(validated.get("description") or ""))
+                            print(
+                                f"  成功: [{validated.get('source')}] {validated.get('product_id')} | "
+                                f"{str(validated.get('title'))[:80]} | description={desc_len} chars"
+                            )
+                        else:
+                            print(
+                                f"  已保存不存在商品: [{validated.get('source')}] "
+                                f"{validated.get('product_id')} | existence=False"
+                            )
+                    else:
+                        print(
+                            f"  已标记原 URL 不存在: [{validated.get('source')}] "
+                            f"{validated.get('product_id')} | existence=False"
+                        )
+
+        failed = primary_failed or (not saved_primary and bool(product_records))
+        await self.mark_url_done(success=primary_success, failed=failed)
+
+
+UrlTask = tuple[str, int, int, int, int]
+
+
+async def browser_worker(
+    worker_id: int,
+    state: CrawlState,
+    task_queue: asyncio.Queue[UrlTask | None],
+    products_path: Path,
+    invalid_path: Path,
+    total_links: int,
+) -> None:
+    worker_label = f"Worker-{worker_id}"
+    captcha_restart_counts: dict[str, int] = {}
+    pending_task: UrlTask | None = None
+    print(f"[{worker_label}] 启动")
+
+    async with async_playwright() as playwright:
+        while True:
+            if await state.should_stop():
+                break
+
+            browser = None
+            context = None
+            try:
+                browser, context, page = await launch_browser_context(playwright, worker_id=worker_id)
+                print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
+                captcha_state = {"solved_once": False}
+
+                while True:
+                    if await state.should_stop():
+                        break
+
+                    if pending_task is None:
+                        item = await task_queue.get()
+                        if item is None:
+                            task_queue.task_done()
+                            return
+                        pending_task = item
+
+                    url, index, batch_no, batch_pos, batch_size = pending_task
+                    if not await state.claim_url(url):
+                        await state.mark_skipped()
+                        task_queue.task_done()
+                        pending_task = None
+                        continue
+
+                    print(
+                        f"[{worker_label}] [{index}/{total_links}] "
+                        f"第 {batch_no} 批 {batch_pos}/{batch_size} 抓取详情: {url}"
+                    )
+                    try:
+                        product_records = await fetch_product(page, url, captcha_state)
+                        if not product_records:
+                            raise BrowserRestartRequired("未获取到商品数据，不保存")
+
+                        await state.save_product_records(products_path, invalid_path, url, product_records)
+                        await state.finish_url(url)
+                        task_queue.task_done()
+                        pending_task = None
+                        await sleep()
+                        continue
+                    except BrowserRestartRequired:
+                        raise
+                    except Exception as exc:
+                        if is_browser_closed_error(exc):
+                            raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
+                        await state.append_invalid(
+                            invalid_path,
+                            {
+                                "url": url,
+                                "product_id": product_id_from_url(url),
+                                "error": str(exc),
+                                "date": datetime.now().replace(microsecond=0).isoformat(),
+                            },
+                        )
+                        await state.mark_url_done(failed=True)
+                        await state.finish_url(url)
+                        task_queue.task_done()
+                        pending_task = None
+                        print(f"  失败: {exc}")
+                        await sleep()
+            except BrowserRestartRequired as exc:
+                if pending_task is None:
+                    continue
+
+                url = pending_task[0]
+                captcha_restart_counts[url] = captcha_restart_counts.get(url, 0) + 1
+                retry_count = captcha_restart_counts[url]
+                print(
+                    f"[{worker_label}] {exc}，当前商品浏览器重启 {retry_count}/"
+                    f"{MAX_CAPTCHA_RESTARTS_PER_URL}。"
+                )
+                print(
+                    f"[{worker_label}] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重新启动浏览器"
+                    + (
+                        "（Webshare rotate 代理将分配新 IP）"
+                        if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
+                        else ""
+                    )
+                    + "。"
+                )
+                if retry_count >= MAX_CAPTCHA_RESTARTS_PER_URL:
+                    await state.append_invalid(
+                        invalid_path,
+                        {
+                            "url": url,
+                            "product_id": product_id_from_url(url),
+                            "error": f"连续 {retry_count} 次遇到验证码，跳过当前商品",
+                            "date": datetime.now().replace(microsecond=0).isoformat(),
+                        },
+                    )
+                    await state.mark_url_done(failed=True)
+                    await state.finish_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    print(f"[{worker_label}] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
+            finally:
+                if context:
+                    try:
+                        await asyncio.wait_for(context.close(), timeout=8)
+                    except Exception:
+                        pass
+                if browser:
+                    try:
+                        await asyncio.wait_for(browser.close(), timeout=8)
+                    except Exception:
+                        pass
+                if worker_id is not None:
+                    clear_browser_user_data(worker_id)
+
+            if pending_task is not None and not await state.should_stop():
+                print(f"[{worker_label}] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
+                await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+
+    print(f"[{worker_label}] 结束")
+
+
+async def run_worker_batch(
+    state: CrawlState,
+    links: list[str],
+    batch_no: int,
+    batch_start: int,
+    total_links: int,
+    products_path: Path,
+    invalid_path: Path,
+) -> None:
+    task_queue: asyncio.Queue[UrlTask | None] = asyncio.Queue()
+    for current_index, url in enumerate(links):
+        if await state.should_stop():
+            break
+        if await state.is_processed(url):
+            await state.mark_skipped()
+            continue
+        global_index = batch_start + current_index + 1
+        await task_queue.put((url, global_index, batch_no, current_index + 1, len(links)))
+
+    if task_queue.empty():
+        return
+
+    workers = [
+        asyncio.create_task(
+            browser_worker(worker_id, state, task_queue, products_path, invalid_path, total_links)
+        )
+        for worker_id in range(WORKER_COUNT)
+    ]
+    await task_queue.join()
+    for _ in range(WORKER_COUNT):
+        await task_queue.put(None)
+    await asyncio.gather(*workers)
+
+
 async def main_async() -> None:
     print("=" * 60)
     print("AliExpress 商品详情抓取")
@@ -2250,7 +2572,11 @@ async def main_async() -> None:
         print("  ELASTICSEARCH_URL=http://emuser1:your_password@34.16.105.219:9200")
         raise SystemExit(1)
     print(f"详情输出目录: {OUTPUT_DIR}")
-    print("浏览器模式: 无痕模式，不保存用户目录")
+    print(f"并发 Worker 数: {WORKER_COUNT}")
+    if WORKER_COUNT > 1:
+        print(f"浏览器 profile 目录: {USER_DATA_DIR}/worker_0 .. worker_{WORKER_COUNT - 1}")
+    else:
+        print("浏览器模式: 无痕模式，不保存用户目录")
     print(f"浏览器代理: {webshare_proxy_label()}")
     print(f"xAI 验证码: {xai_config_label()}")
     print(f"验证码重试: {captcha_restart_label()}")
@@ -2261,23 +2587,18 @@ async def main_async() -> None:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     clear_browser_user_data()
-    processed_urls = load_progress()
+    state = CrawlState(load_progress())
     products_path = PRODUCTS_FILE
     invalid_path = INVALID_FILE
     total_links = get_total_link_count()
     print(f"[ES链接] 索引 {URLS_INDEX_NAME} 总数: {total_links}")
 
-    success = 0
-    failed = 0
-    skipped = 0
-    completed = 0
     batch_no = 0
     fetched_count = 0
     search_after: list[Any] | None = None
-    captcha_restart_counts: dict[str, int] = {}
 
     while True:
-        if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
+        if await state.should_stop():
             break
         links, search_after = load_link_batch(search_after)
         if not links:
@@ -2287,184 +2608,25 @@ async def main_async() -> None:
         batch_no += 1
         batch_start = fetched_count
         fetched_count += len(links)
-        current_index = 0
         print(f"[ES链接] 第 {batch_no} 批读取 {len(links)} 条，累计读取 {fetched_count}/{total_links}")
-
-        batch_finished = False
-        async with async_playwright() as playwright:
-            while current_index < len(links):
-                if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
-                    batch_finished = True
-                    break
-
-                browser = None
-                context = None
-                try:
-                    browser, context, page = await launch_browser_context(playwright)
-                    print("浏览器已打开（无痕模式）。")
-                    captcha_state = {"solved_once": False}
-
-                    with products_path.open("a", encoding="utf-8") as products_fh, invalid_path.open(
-                        "a", encoding="utf-8"
-                    ) as invalid_fh:
-                        while current_index < len(links):
-                            if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
-                                batch_finished = True
-                                break
-
-                            url = links[current_index]
-                            index = batch_start + current_index + 1
-                            if url in processed_urls:
-                                skipped += 1
-                                current_index += 1
-                                continue
-
-                            print(f"[{index}/{total_links}] 第 {batch_no} 批 {current_index + 1}/{len(links)} 抓取详情: {url}")
-                            try:
-                                product_records = await fetch_product(page, url, captcha_state)
-                                if not product_records:
-                                    raise BrowserRestartRequired("未获取到商品数据，不保存")
-
-                                saved_primary = False
-                                for record_idx, product in enumerate(product_records):
-                                    validated, validation_error = validate_product_record(product)
-                                    if not validated:
-                                        invalid_fh.write(
-                                            json.dumps(
-                                                {
-                                                    "url": url,
-                                                    "product_id": product_id_from_url(url),
-                                                    "error": validation_error or "StandardProduct 校验失败",
-                                                    "date": datetime.now().replace(microsecond=0).isoformat(),
-                                                },
-                                                ensure_ascii=False,
-                                            )
-                                            + "\n"
-                                        )
-                                        invalid_fh.flush()
-                                        if record_idx == 0:
-                                            failed += 1
-                                        print(f"  失败: {validation_error}")
-                                        continue
-
-                                    products_fh.write(json.dumps(validated, ensure_ascii=False) + "\n")
-                                    products_fh.flush()
-                                    upload_product(validated)
-                                    if record_idx == 0:
-                                        saved_primary = True
-                                        if validated.get("existence"):
-                                            success += 1
-                                            desc_len = len(str(validated.get("description") or ""))
-                                            print(
-                                                f"  成功: [{validated.get('source')}] {validated.get('product_id')} | "
-                                                f"{str(validated.get('title'))[:80]} | description={desc_len} chars"
-                                            )
-                                        else:
-                                            print(
-                                                f"  已保存不存在商品: [{validated.get('source')}] "
-                                                f"{validated.get('product_id')} | existence=False"
-                                            )
-                                    else:
-                                        print(
-                                            f"  已标记原 URL 不存在: [{validated.get('source')}] "
-                                            f"{validated.get('product_id')} | existence=False"
-                                        )
-
-                                if not saved_primary and product_records:
-                                    failed += 1
-                                processed_urls.add(url)
-                                save_progress(processed_urls)
-                                current_index += 1
-                                completed += 1
-                                await sleep()
-                                continue
-                            except BrowserRestartRequired:
-                                raise
-                            except Exception as exc:
-                                if is_browser_closed_error(exc):
-                                    raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
-                                failed += 1
-                                invalid_fh.write(
-                                    json.dumps(
-                                        {
-                                            "url": url,
-                                            "product_id": product_id_from_url(url),
-                                            "error": str(exc),
-                                            "date": datetime.now().replace(microsecond=0).isoformat(),
-                                        },
-                                        ensure_ascii=False,
-                                    )
-                                    + "\n"
-                                )
-                                invalid_fh.flush()
-                                processed_urls.add(url)
-                                save_progress(processed_urls)
-                                current_index += 1
-                                completed += 1
-                                print(f"  失败: {exc}")
-
-                            await sleep()
-                        if current_index >= len(links):
-                            batch_finished = True
-                except BrowserRestartRequired as exc:
-                    current_url = links[current_index] if current_index < len(links) else ""
-                    captcha_restart_counts[current_url] = captcha_restart_counts.get(current_url, 0) + 1
-                    retry_count = captcha_restart_counts[current_url]
-                    print(
-                        f"[主流程] {exc}，当前商品浏览器重启 {retry_count}/"
-                        f"{MAX_CAPTCHA_RESTARTS_PER_URL}。"
-                    )
-                    print(
-                        f"[主流程] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重新启动浏览器"
-                        + ("（Webshare rotate 代理将分配新 IP）" if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate") else "")
-                        + "。"
-                    )
-                    if retry_count >= MAX_CAPTCHA_RESTARTS_PER_URL:
-                        with invalid_path.open("a", encoding="utf-8") as invalid_fh:
-                            invalid_fh.write(
-                                json.dumps(
-                                    {
-                                        "url": current_url,
-                                        "product_id": product_id_from_url(current_url),
-                                        "error": f"连续 {retry_count} 次遇到验证码，跳过当前商品",
-                                        "date": datetime.now().replace(microsecond=0).isoformat(),
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
-                        failed += 1
-                        processed_urls.add(current_url)
-                        save_progress(processed_urls)
-                        current_index += 1
-                        completed += 1
-                        print("[主流程] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
-                finally:
-                    if context:
-                        try:
-                            await asyncio.wait_for(context.close(), timeout=8)
-                        except Exception:
-                            pass
-                    if browser:
-                        try:
-                            await asyncio.wait_for(browser.close(), timeout=8)
-                        except Exception:
-                            pass
-                    clear_browser_user_data()
-
-                if not batch_finished and current_index < len(links):
-                    print(f"[主流程] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
-                    await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
-
-        if MAX_PRODUCTS > 0 and completed >= MAX_PRODUCTS:
+        await run_worker_batch(
+            state,
+            links,
+            batch_no,
+            batch_start,
+            total_links,
+            products_path,
+            invalid_path,
+        )
+        if await state.should_stop():
             break
         print(f"[ES链接] 第 {batch_no} 批处理完成，准备读取下一批。")
 
     print("\n完成。")
-    print(f"成功: {success}")
-    print(f"失败: {failed}")
-    print(f"已完成: {completed}")
-    print(f"跳过已处理: {skipped}")
+    print(f"成功: {state.success}")
+    print(f"失败: {state.failed}")
+    print(f"已完成: {state.completed}")
+    print(f"跳过已处理: {state.skipped}")
     print(f"详情文件: {products_path}")
     print(f"失败文件: {invalid_path}")
     print(f"进度文件: {PROGRESS_FILE}")
