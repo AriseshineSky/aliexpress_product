@@ -2271,6 +2271,7 @@ class CrawlState:
     def __init__(self, processed_urls: set[str]):
         self.processed_urls = processed_urls
         self.in_progress: set[str] = set()
+        self.in_progress_product_ids: set[str] = set()
         self.lock = asyncio.Lock()
         self.file_lock = asyncio.Lock()
         self.stats_lock = asyncio.Lock()
@@ -2281,22 +2282,40 @@ class CrawlState:
 
     async def is_processed(self, url: str) -> bool:
         async with self.lock:
-            return url in self.processed_urls or url in self.in_progress
+            return url in self.processed_urls
 
-    async def claim_url(self, url: str) -> bool:
+    async def claim_url(self, url: str) -> tuple[bool, str]:
+        """Reserve a URL for one worker.
+
+        Returns (claimed, reason) where reason is:
+        - ok: URL claimed successfully
+        - duplicate: URL already processed or claimed by another worker
+        - product_busy: another worker is already scraping this product_id
+        """
+        product_id = product_id_from_url(url)
         async with self.lock:
             if url in self.processed_urls or url in self.in_progress:
-                return False
+                return False, "duplicate"
+            if product_id and product_id in self.in_progress_product_ids:
+                return False, "product_busy"
             self.in_progress.add(url)
-            return True
+            if product_id:
+                self.in_progress_product_ids.add(product_id)
+            return True, "ok"
 
     async def release_url(self, url: str) -> None:
+        product_id = product_id_from_url(url)
         async with self.lock:
             self.in_progress.discard(url)
+            if product_id:
+                self.in_progress_product_ids.discard(product_id)
 
     async def finish_url(self, url: str) -> None:
+        product_id = product_id_from_url(url)
         async with self.lock:
             self.in_progress.discard(url)
+            if product_id:
+                self.in_progress_product_ids.discard(product_id)
             self.processed_urls.add(url)
             save_progress(self.processed_urls)
 
@@ -2445,7 +2464,14 @@ async def browser_worker(
                     pending_task = item
 
                 url, index, batch_no, batch_pos, batch_size = pending_task
-                if not await state.claim_url(url):
+                claimed, claim_reason = await state.claim_url(url)
+                if not claimed:
+                    if claim_reason == "product_busy":
+                        await task_queue.put(pending_task)
+                        task_queue.task_done()
+                        pending_task = None
+                        await asyncio.sleep(0.3)
+                        continue
                     await state.mark_skipped()
                     task_queue.task_done()
                     pending_task = None
@@ -2558,6 +2584,9 @@ async def run_worker_batch(
     invalid_path: Path,
 ) -> None:
     task_queue: asyncio.Queue[UrlTask | None] = asyncio.Queue()
+    deferred_tasks: list[UrlTask] = []
+    queued_product_ids: set[str] = set()
+
     for current_index, url in enumerate(links):
         if await state.should_stop():
             break
@@ -2565,7 +2594,22 @@ async def run_worker_batch(
             await state.mark_skipped()
             continue
         global_index = batch_start + current_index + 1
-        await task_queue.put((url, global_index, batch_no, current_index + 1, len(links)))
+        task = (url, global_index, batch_no, current_index + 1, len(links))
+        product_id = product_id_from_url(url)
+        if product_id and product_id in queued_product_ids:
+            deferred_tasks.append(task)
+            continue
+        if product_id:
+            queued_product_ids.add(product_id)
+        await task_queue.put(task)
+
+    for task in deferred_tasks:
+        if await state.should_stop():
+            break
+        if await state.is_processed(task[0]):
+            await state.mark_skipped()
+            continue
+        await task_queue.put(task)
 
     if task_queue.empty():
         return
