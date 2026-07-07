@@ -229,6 +229,8 @@ def captcha_restart_label() -> str:
 
 def build_chromium_args(worker_id: int = 0) -> list[str]:
     args = list(CHROMIUM_ARGS)
+    if WORKER_COUNT > 1:
+        args = [arg for arg in args if arg != "--start-maximized"]
     if not HEADLESS and WORKER_COUNT > 1:
         cols = min(WORKER_COUNT, 3)
         row = worker_id // cols
@@ -2394,104 +2396,68 @@ async def browser_worker(
     products_path: Path,
     invalid_path: Path,
     total_links: int,
+    playwright,
 ) -> None:
     worker_label = f"Worker-{worker_id}"
     captcha_restart_counts: dict[str, int] = {}
     pending_task: UrlTask | None = None
     print(f"[{worker_label}] 启动")
 
-    async with async_playwright() as playwright:
-        while True:
-            if await state.should_stop():
-                break
+    while True:
+        if await state.should_stop():
+            break
 
-            browser = None
-            context = None
-            try:
-                browser, context, page = await launch_browser_context(playwright, worker_id=worker_id)
-                print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
-                captcha_state = {"solved_once": False}
+        browser = None
+        context = None
+        try:
+            browser, context, page = await launch_browser_context(playwright, worker_id=worker_id)
+            print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
+            captcha_state = {"solved_once": False}
 
-                while True:
-                    if await state.should_stop():
-                        break
+            while True:
+                if await state.should_stop():
+                    break
 
-                    if pending_task is None:
-                        item = await task_queue.get()
-                        if item is None:
-                            task_queue.task_done()
-                            return
-                        pending_task = item
-
-                    url, index, batch_no, batch_pos, batch_size = pending_task
-                    if not await state.claim_url(url):
-                        await state.mark_skipped()
-                        task_queue.task_done()
-                        pending_task = None
-                        continue
-
-                    print(
-                        f"[{worker_label}] [{index}/{total_links}] "
-                        f"第 {batch_no} 批 {batch_pos}/{batch_size} 抓取详情: {url}"
-                    )
-                    try:
-                        product_records = await fetch_product(page, url, captcha_state)
-                        if not product_records:
-                            raise BrowserRestartRequired("未获取到商品数据，不保存")
-
-                        await state.save_product_records(products_path, invalid_path, url, product_records)
-                        await state.finish_url(url)
-                        task_queue.task_done()
-                        pending_task = None
-                        await sleep()
-                        continue
-                    except BrowserRestartRequired:
-                        raise
-                    except Exception as exc:
-                        if is_browser_closed_error(exc):
-                            raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
-                        await state.append_invalid(
-                            invalid_path,
-                            {
-                                "url": url,
-                                "product_id": product_id_from_url(url),
-                                "error": str(exc),
-                                "date": datetime.now().replace(microsecond=0).isoformat(),
-                            },
-                        )
-                        await state.mark_url_done(failed=True)
-                        await state.finish_url(url)
-                        task_queue.task_done()
-                        pending_task = None
-                        print(f"  失败: {exc}")
-                        await sleep()
-            except BrowserRestartRequired as exc:
                 if pending_task is None:
+                    item = await task_queue.get()
+                    if item is None:
+                        task_queue.task_done()
+                        return
+                    pending_task = item
+
+                url, index, batch_no, batch_pos, batch_size = pending_task
+                if not await state.claim_url(url):
+                    await state.mark_skipped()
+                    task_queue.task_done()
+                    pending_task = None
                     continue
 
-                url = pending_task[0]
-                captcha_restart_counts[url] = captcha_restart_counts.get(url, 0) + 1
-                retry_count = captcha_restart_counts[url]
                 print(
-                    f"[{worker_label}] {exc}，当前商品浏览器重启 {retry_count}/"
-                    f"{MAX_CAPTCHA_RESTARTS_PER_URL}。"
+                    f"[{worker_label}] [{index}/{total_links}] "
+                    f"第 {batch_no} 批 {batch_pos}/{batch_size} 抓取详情: {url}"
                 )
-                print(
-                    f"[{worker_label}] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重新启动浏览器"
-                    + (
-                        "（Webshare rotate 代理将分配新 IP）"
-                        if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
-                        else ""
-                    )
-                    + "。"
-                )
-                if retry_count >= MAX_CAPTCHA_RESTARTS_PER_URL:
+                try:
+                    product_records = await fetch_product(page, url, captcha_state)
+                    if not product_records:
+                        raise BrowserRestartRequired("未获取到商品数据，不保存")
+
+                    await state.save_product_records(products_path, invalid_path, url, product_records)
+                    await state.finish_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    await sleep()
+                    continue
+                except BrowserRestartRequired:
+                    raise
+                except Exception as exc:
+                    if is_browser_closed_error(exc):
+                        raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
                     await state.append_invalid(
                         invalid_path,
                         {
                             "url": url,
                             "product_id": product_id_from_url(url),
-                            "error": f"连续 {retry_count} 次遇到验证码，跳过当前商品",
+                            "error": str(exc),
                             "date": datetime.now().replace(microsecond=0).isoformat(),
                         },
                     )
@@ -2499,24 +2465,60 @@ async def browser_worker(
                     await state.finish_url(url)
                     task_queue.task_done()
                     pending_task = None
-                    print(f"[{worker_label}] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
-            finally:
-                if context:
-                    try:
-                        await asyncio.wait_for(context.close(), timeout=8)
-                    except Exception:
-                        pass
-                if browser:
-                    try:
-                        await asyncio.wait_for(browser.close(), timeout=8)
-                    except Exception:
-                        pass
-                if worker_id is not None:
-                    clear_browser_user_data(worker_id)
+                    print(f"  失败: {exc}")
+                    await sleep()
+        except BrowserRestartRequired as exc:
+            if pending_task is None:
+                continue
 
-            if pending_task is not None and not await state.should_stop():
-                print(f"[{worker_label}] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
-                await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+            url = pending_task[0]
+            captcha_restart_counts[url] = captcha_restart_counts.get(url, 0) + 1
+            retry_count = captcha_restart_counts[url]
+            print(
+                f"[{worker_label}] {exc}，当前商品浏览器重启 {retry_count}/"
+                f"{MAX_CAPTCHA_RESTARTS_PER_URL}。"
+            )
+            print(
+                f"[{worker_label}] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重新启动浏览器"
+                + (
+                    "（Webshare rotate 代理将分配新 IP）"
+                    if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
+                    else ""
+                )
+                + "。"
+            )
+            if retry_count >= MAX_CAPTCHA_RESTARTS_PER_URL:
+                await state.append_invalid(
+                    invalid_path,
+                    {
+                        "url": url,
+                        "product_id": product_id_from_url(url),
+                        "error": f"连续 {retry_count} 次遇到验证码，跳过当前商品",
+                        "date": datetime.now().replace(microsecond=0).isoformat(),
+                    },
+                )
+                await state.mark_url_done(failed=True)
+                await state.finish_url(url)
+                task_queue.task_done()
+                pending_task = None
+                print(f"[{worker_label}] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
+        finally:
+            if context:
+                try:
+                    await asyncio.wait_for(context.close(), timeout=8)
+                except Exception:
+                    pass
+            if browser:
+                try:
+                    await asyncio.wait_for(browser.close(), timeout=8)
+                except Exception:
+                    pass
+            if worker_id is not None:
+                clear_browser_user_data(worker_id)
+
+        if pending_task is not None and not await state.should_stop():
+            print(f"[{worker_label}] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
+            await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
 
     print(f"[{worker_label}] 结束")
 
@@ -2543,16 +2545,28 @@ async def run_worker_batch(
     if task_queue.empty():
         return
 
-    workers = [
-        asyncio.create_task(
-            browser_worker(worker_id, state, task_queue, products_path, invalid_path, total_links)
-        )
-        for worker_id in range(WORKER_COUNT)
-    ]
-    await task_queue.join()
-    for _ in range(WORKER_COUNT):
-        await task_queue.put(None)
-    await asyncio.gather(*workers)
+    pending_count = task_queue.qsize()
+    print(f"[批次 {batch_no}] 待抓取 {pending_count} 条，启动 {WORKER_COUNT} 个 Worker")
+
+    async with async_playwright() as playwright:
+        workers = [
+            asyncio.create_task(
+                browser_worker(
+                    worker_id,
+                    state,
+                    task_queue,
+                    products_path,
+                    invalid_path,
+                    total_links,
+                    playwright,
+                )
+            )
+            for worker_id in range(WORKER_COUNT)
+        ]
+        await task_queue.join()
+        for _ in range(WORKER_COUNT):
+            await task_queue.put(None)
+        await asyncio.gather(*workers)
 
 
 async def main_async() -> None:
