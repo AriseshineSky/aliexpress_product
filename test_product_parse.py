@@ -244,6 +244,32 @@ class ProductParseTestCase(unittest.TestCase):
         self.assertIn("aliexpress.com", validated["summary"])
         self.assertIn("aliexpress.us", validated["summary"])
 
+    def test_priority_url_query(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        priority = mod.build_url_query(priority=True)
+        must = priority["bool"]["must"]
+        self.assertTrue(any(item.get("exists", {}).get("field") == "url" for item in must))
+        self.assertTrue(any(item.get("range", {}).get("price", {}).get("lt") == mod.PRIORITY_MAX_PRICE for item in must))
+        self.assertTrue(
+            any(item.get("range", {}).get("rating", {}).get("gte") == mod.PRIORITY_MIN_RATING for item in must)
+        )
+        self.assertTrue(
+            any(item.get("range", {}).get("reviews", {}).get("gte") == mod.PRIORITY_MIN_REVIEWS for item in must)
+        )
+        self.assertTrue(
+            any(item.get("range", {}).get("sold_count", {}).get("gte") == mod.PRIORITY_MIN_SOLD for item in must)
+        )
+
+        rest = mod.build_url_query(exclude_priority=True)
+        self.assertIn("must_not", rest["bool"])
+        label = mod.priority_filter_label()
+        self.assertIn("price<", label)
+        self.assertIn("rating>=", label)
+
 
 if __name__ == "__main__":
     unittest.main()

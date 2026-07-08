@@ -108,6 +108,14 @@ WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0") or "0")
 REQUEST_DELAY_MS = (2000, 4000)
 
+# 优先抓取筛选（URL 索引里的列表页指标）
+PRIORITY_FIRST = os.environ.get("PRIORITY_FIRST", "1").strip().lower() in ("1", "true", "yes", "on")
+PRIORITY_ONLY = os.environ.get("PRIORITY_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+PRIORITY_MAX_PRICE = float(os.environ.get("PRIORITY_MAX_PRICE", "100") or "100")
+PRIORITY_MIN_RATING = float(os.environ.get("PRIORITY_MIN_RATING", "4.4") or "4.4")
+PRIORITY_MIN_REVIEWS = int(os.environ.get("PRIORITY_MIN_REVIEWS", "1000") or "1000")
+PRIORITY_MIN_SOLD = int(os.environ.get("PRIORITY_MIN_SOLD", "1000") or "1000")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -287,15 +295,58 @@ async def launch_browser_context(playwright, worker_id: int = 0, retries: int = 
     raise RuntimeError("浏览器启动失败")
 
 
-def get_total_link_count() -> int:
+def build_url_query(*, priority: bool = False, exclude_priority: bool = False) -> dict[str, Any]:
+    """Build ES query for the URL index.
+
+    priority=True: price < max, rating/reviews/sold_count >= mins
+    exclude_priority=True: everything that does NOT match priority (phase 2)
+    """
+    base_must: list[dict[str, Any]] = [{"exists": {"field": "url"}}]
+    priority_must: list[dict[str, Any]] = [
+        {"range": {"price": {"lt": PRIORITY_MAX_PRICE}}},
+        {"range": {"rating": {"gte": PRIORITY_MIN_RATING}}},
+        {"range": {"reviews": {"gte": PRIORITY_MIN_REVIEWS}}},
+        {"range": {"sold_count": {"gte": PRIORITY_MIN_SOLD}}},
+    ]
+    if priority:
+        return {"bool": {"must": base_must + priority_must}}
+    if exclude_priority:
+        return {
+            "bool": {
+                "must": base_must,
+                "must_not": [{"bool": {"must": priority_must}}],
+            }
+        }
+    return {"bool": {"must": base_must}}
+
+
+def priority_filter_label() -> str:
+    return (
+        f"price<{PRIORITY_MAX_PRICE}, rating>={PRIORITY_MIN_RATING}, "
+        f"reviews>={PRIORITY_MIN_REVIEWS}, sold_count>={PRIORITY_MIN_SOLD}"
+    )
+
+
+def get_total_link_count(*, priority: bool = False, exclude_priority: bool = False) -> int:
     """获取 Elasticsearch 产品链接索引总数。"""
     base_url = f"http://{ES_HOST}:{ES_PORT}/{URLS_INDEX_NAME}"
-    count_resp = requests.get(f"{base_url}/_count", auth=(ES_USER, ES_PASSWORD), timeout=30)
+    body = {"query": build_url_query(priority=priority, exclude_priority=exclude_priority)}
+    count_resp = requests.post(
+        f"{base_url}/_count",
+        auth=(ES_USER, ES_PASSWORD),
+        json=body,
+        timeout=30,
+    )
     count_resp.raise_for_status()
     return int(count_resp.json().get("count", 0))
 
 
-def load_link_batch(search_after: list[Any] | None = None) -> tuple[list[str], list[Any] | None]:
+def load_link_batch(
+    search_after: list[Any] | None = None,
+    *,
+    priority: bool = False,
+    exclude_priority: bool = False,
+) -> tuple[list[str], list[Any] | None]:
     """从 Elasticsearch 产品链接索引读取一批 URL。"""
     base_url = f"http://{ES_HOST}:{ES_PORT}/{URLS_INDEX_NAME}"
     auth = (ES_USER, ES_PASSWORD)
@@ -303,7 +354,7 @@ def load_link_batch(search_after: list[Any] | None = None) -> tuple[list[str], l
     search_body = {
         "_source": ["url", "product_id"],
         "size": URLS_BATCH_SIZE,
-        "query": {"exists": {"field": "url"}},
+        "query": build_url_query(priority=priority, exclude_priority=exclude_priority),
         "sort": [
             {"product_id": {"order": "asc", "missing": "_last"}},
             {"url": {"order": "asc"}},
@@ -328,6 +379,76 @@ def load_link_batch(search_after: list[Any] | None = None) -> tuple[list[str], l
 
     next_search_after = hits[-1].get("sort") if hits else None
     return links, next_search_after
+
+
+async def crawl_link_phases(
+    state: "CrawlState",
+    products_path: Path,
+    invalid_path: Path,
+) -> None:
+    """Crawl priority URLs first, then remaining URLs when configured."""
+    phases: list[tuple[str, bool, bool]] = []
+    if PRIORITY_FIRST or PRIORITY_ONLY:
+        phases.append(("优先筛选", True, False))
+        if not PRIORITY_ONLY:
+            phases.append(("其余商品", False, True))
+    else:
+        phases.append(("全部链接", False, False))
+
+    batch_no = 0
+    for phase_name, priority, exclude_priority in phases:
+        if await state.should_stop():
+            break
+        total_links = get_total_link_count(priority=priority, exclude_priority=exclude_priority)
+        print(f"[ES链接] 阶段「{phase_name}」: {total_links} 条")
+        if priority or (PRIORITY_FIRST and not exclude_priority):
+            print(f"[ES链接] 筛选条件: {priority_filter_label()}")
+        if total_links <= 0:
+            print(f"[ES链接] 阶段「{phase_name}」无待抓链接，跳过。")
+            continue
+
+        fetched_count = 0
+        search_after: list[Any] | None = None
+        phase_batches = 0
+        while True:
+            if await state.should_stop():
+                break
+            links, search_after = load_link_batch(
+                search_after,
+                priority=priority,
+                exclude_priority=exclude_priority,
+            )
+            if not links:
+                if phase_batches == 0:
+                    print(f"[ES链接] 阶段「{phase_name}」没有找到商品链接。")
+                break
+            batch_no += 1
+            phase_batches += 1
+            batch_start = fetched_count
+            fetched_count += len(links)
+            print(
+                f"[ES链接] [{phase_name}] 第 {batch_no} 批读取 {len(links)} 条，"
+                f"本阶段累计 {fetched_count}/{total_links}"
+            )
+            await run_worker_batch(
+                state,
+                links,
+                batch_no,
+                batch_start,
+                total_links,
+                products_path,
+                invalid_path,
+            )
+            if await state.should_stop():
+                break
+            print(f"[ES链接] [{phase_name}] 第 {batch_no} 批处理完成，准备读取下一批。")
+
+        if PRIORITY_ONLY:
+            break
+        if await state.should_stop():
+            break
+        if priority and not PRIORITY_ONLY:
+            print("[ES链接] 优先筛选阶段结束，开始抓取其余商品。")
 
 
 def upload_product(product: dict[str, Any]) -> bool:
@@ -2758,6 +2879,12 @@ async def main_async() -> None:
     print(f"xAI 验证码: {xai_config_label()}")
     print(f"验证码重试: {captcha_restart_label()}")
     print(f"浏览器重启等待: {BROWSER_RESTART_DELAY_SECONDS}s（重启前会清空 profile）")
+    if PRIORITY_FIRST or PRIORITY_ONLY:
+        mode = "仅优先筛选" if PRIORITY_ONLY else "优先筛选后再抓其余"
+        print(f"抓取策略: {mode}")
+        print(f"优先条件: {priority_filter_label()}")
+    else:
+        print("抓取策略: 全部链接（未启用优先筛选）")
     if MAX_PRODUCTS > 0:
         print(f"本地试跑: 最多处理 {MAX_PRODUCTS} 条商品")
     print()
@@ -2767,37 +2894,10 @@ async def main_async() -> None:
     state = CrawlState(load_progress())
     products_path = PRODUCTS_FILE
     invalid_path = INVALID_FILE
-    total_links = get_total_link_count()
-    print(f"[ES链接] 索引 {URLS_INDEX_NAME} 总数: {total_links}")
+    total_all = get_total_link_count()
+    print(f"[ES链接] 索引 {URLS_INDEX_NAME} 总数: {total_all}")
 
-    batch_no = 0
-    fetched_count = 0
-    search_after: list[Any] | None = None
-
-    while True:
-        if await state.should_stop():
-            break
-        links, search_after = load_link_batch(search_after)
-        if not links:
-            if batch_no == 0:
-                print("ES 链接索引中没有找到商品链接。")
-            break
-        batch_no += 1
-        batch_start = fetched_count
-        fetched_count += len(links)
-        print(f"[ES链接] 第 {batch_no} 批读取 {len(links)} 条，累计读取 {fetched_count}/{total_links}")
-        await run_worker_batch(
-            state,
-            links,
-            batch_no,
-            batch_start,
-            total_links,
-            products_path,
-            invalid_path,
-        )
-        if await state.should_stop():
-            break
-        print(f"[ES链接] 第 {batch_no} 批处理完成，准备读取下一批。")
+    await crawl_link_phases(state, products_path, invalid_path)
 
     print("\n完成。")
     print(f"成功: {state.success}")
