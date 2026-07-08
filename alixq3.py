@@ -2444,6 +2444,31 @@ async def browser_worker(
         if await state.should_stop():
             break
 
+        # Claim a URL before opening the browser so idle workers do not sit on about:blank.
+        while pending_task is None:
+            if await state.should_stop():
+                print(f"[{worker_label}] 结束")
+                return
+
+            item = await task_queue.get()
+            if item is None:
+                task_queue.task_done()
+                print(f"[{worker_label}] 结束")
+                return
+
+            claimed, claim_reason = await state.claim_url(item[0])
+            if not claimed:
+                if claim_reason == "product_busy":
+                    await task_queue.put(item)
+                    task_queue.task_done()
+                    await asyncio.sleep(0.3)
+                    continue
+                await state.mark_skipped()
+                task_queue.task_done()
+                continue
+            pending_task = item
+
+        url, index, batch_no, batch_pos, batch_size = pending_task
         browser = None
         context = None
         reset_after_product = False
@@ -2451,70 +2476,42 @@ async def browser_worker(
             browser, context, page = await launch_browser_context(playwright, worker_id=worker_id)
             print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
             captcha_state = {"solved_once": False}
+            print(
+                f"[{worker_label}] [{index}/{total_links}] "
+                f"第 {batch_no} 批 {batch_pos}/{batch_size} 抓取详情: {url}"
+            )
+            try:
+                product_records = await fetch_product(page, url, captcha_state)
+                if not product_records:
+                    raise BrowserRestartRequired("未获取到商品数据，不保存")
 
-            while True:
-                if await state.should_stop():
-                    break
-
-                if pending_task is None:
-                    item = await task_queue.get()
-                    if item is None:
-                        task_queue.task_done()
-                        return
-                    pending_task = item
-
-                url, index, batch_no, batch_pos, batch_size = pending_task
-                claimed, claim_reason = await state.claim_url(url)
-                if not claimed:
-                    if claim_reason == "product_busy":
-                        await task_queue.put(pending_task)
-                        task_queue.task_done()
-                        pending_task = None
-                        await asyncio.sleep(0.3)
-                        continue
-                    await state.mark_skipped()
-                    task_queue.task_done()
-                    pending_task = None
-                    continue
-
-                print(
-                    f"[{worker_label}] [{index}/{total_links}] "
-                    f"第 {batch_no} 批 {batch_pos}/{batch_size} 抓取详情: {url}"
+                await state.save_product_records(products_path, invalid_path, url, product_records)
+                await state.finish_url(url)
+                task_queue.task_done()
+                pending_task = None
+                reset_after_product = True
+                await sleep()
+            except BrowserRestartRequired:
+                raise
+            except Exception as exc:
+                if is_browser_closed_error(exc):
+                    raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
+                await state.append_invalid(
+                    invalid_path,
+                    {
+                        "url": url,
+                        "product_id": product_id_from_url(url),
+                        "error": str(exc),
+                        "date": datetime.now().replace(microsecond=0).isoformat(),
+                    },
                 )
-                try:
-                    product_records = await fetch_product(page, url, captcha_state)
-                    if not product_records:
-                        raise BrowserRestartRequired("未获取到商品数据，不保存")
-
-                    await state.save_product_records(products_path, invalid_path, url, product_records)
-                    await state.finish_url(url)
-                    task_queue.task_done()
-                    pending_task = None
-                    reset_after_product = True
-                    await sleep()
-                    break
-                except BrowserRestartRequired:
-                    raise
-                except Exception as exc:
-                    if is_browser_closed_error(exc):
-                        raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
-                    await state.append_invalid(
-                        invalid_path,
-                        {
-                            "url": url,
-                            "product_id": product_id_from_url(url),
-                            "error": str(exc),
-                            "date": datetime.now().replace(microsecond=0).isoformat(),
-                        },
-                    )
-                    await state.mark_url_done(failed=True)
-                    await state.finish_url(url)
-                    task_queue.task_done()
-                    pending_task = None
-                    reset_after_product = True
-                    print(f"  失败: {exc}")
-                    await sleep()
-                    break
+                await state.mark_url_done(failed=True)
+                await state.finish_url(url)
+                task_queue.task_done()
+                pending_task = None
+                reset_after_product = True
+                print(f"  失败: {exc}")
+                await sleep()
         except BrowserRestartRequired as exc:
             if pending_task is None:
                 continue
