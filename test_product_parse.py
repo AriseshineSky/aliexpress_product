@@ -127,6 +127,45 @@ class ProductParseTestCase(unittest.TestCase):
             )
         )
 
+    def test_is_invalid_product_record(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(
+            mod.is_invalid_product_record(
+                {
+                    "existence": True,
+                    "price": 0.0,
+                    "title": "This site can\u2019t be reached",
+                    "description": "<p>This site can\u2019t be reached</p>",
+                    "url": "https://www.aliexpress.us/item/123.html",
+                }
+            )
+        )
+        self.assertFalse(
+            mod.is_invalid_product_record(
+                {
+                    "existence": False,
+                    "price": 0.0,
+                    "title": "Unavailable Product 123",
+                    "description": mod.MISSING_PRODUCT_DESCRIPTION,
+                    "url": "https://www.aliexpress.us/item/123.html",
+                }
+            )
+        )
+        self.assertFalse(
+            mod.is_invalid_product_record(
+                {
+                    "existence": True,
+                    "price": 9.99,
+                    "title": "Pet Grooming Brush",
+                    "url": "https://www.aliexpress.us/item/123.html",
+                }
+            )
+        )
+
     def test_unavailable_product_detects_generic_title(self):
         import importlib.util
 

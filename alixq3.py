@@ -97,9 +97,9 @@ WEBSHARE_ROTATE = os.environ.get("WEBSHARE_ROTATE", "1").strip().lower() in ("1"
 HEADLESS = os.environ.get("HEADLESS", "0").strip().lower() in ("1", "true", "yes", "on")
 CAPTCHA_WAIT_SECONDS = 120
 CAPTCHA_MAX_ROUNDS = 30
-CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("CAPTCHA_RECOVERY_ROUNDS", "5") or "5")
+CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("CAPTCHA_RECOVERY_ROUNDS", "2") or "2")
 CAPTCHA_MANUAL_PAUSE_SECONDS = int(os.environ.get("CAPTCHA_MANUAL_PAUSE_SECONDS", "8") or "8")
-MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("MAX_CAPTCHA_RESTARTS_PER_URL", "3") or "3")
+MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("MAX_CAPTCHA_RESTARTS_PER_URL", "2") or "2")
 MAX_NETWORK_RESTARTS_PER_URL = int(os.environ.get("MAX_NETWORK_RESTARTS_PER_URL", "3") or "3")
 BROWSER_RESTART_DELAY_SECONDS = int(os.environ.get("BROWSER_RESTART_DELAY_SECONDS", "5") or "5")
 WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
@@ -245,9 +245,11 @@ def webshare_proxy_label() -> str:
 
 
 def captcha_restart_label() -> str:
+    total = CAPTCHA_RECOVERY_ROUNDS * MAX_CAPTCHA_RESTARTS_PER_URL
     return (
-        f"单轮最多 {CAPTCHA_RECOVERY_ROUNDS} 次验证码尝试，"
+        f"单轮 {CAPTCHA_RECOVERY_ROUNDS} 次验证码尝试，"
         f"单商品最多重启浏览器 {MAX_CAPTCHA_RESTARTS_PER_URL} 次"
+        f"（合计最多 {total} 次）"
     )
 
 
@@ -501,6 +503,11 @@ async def crawl_link_phases(
 
 def upload_product(product: dict[str, Any]) -> bool:
     """上传产品详情到 Elasticsearch 产品索引。"""
+    if is_invalid_product_record(product):
+        title = str(product.get("title") or "")[:80]
+        print(f"  [上传跳过] 无效商品数据，不上传 ES: {title or product.get('product_id')}")
+        return False
+
     product_id = str(product.get("product_id") or product_id_from_url(str(product.get("url") or ""))).strip()
     if not product_id:
         print("  [上传失败] 缺少 product_id")
@@ -754,15 +761,27 @@ def raise_if_missing_available_price(record: dict[str, Any], *, url: str) -> Non
         raise MissingPriceError(f"商品可售但价格为 0，不保存: {url}")
 
 
+def is_invalid_product_record(record: dict[str, Any]) -> bool:
+    """Product payload that must not be saved or uploaded (network errors, incomplete fetches)."""
+    title = str(record.get("title") or "")
+    description = str(record.get("description") or "")
+    url = str(record.get("url") or "")
+    if is_browser_network_error_page(title=title, page_text=description, page_url=url):
+        return True
+    if record.get("existence") and (not title or title == "ERROR" or is_generic_page_title(title)):
+        return True
+    return is_missing_available_price(record)
+
+
 def is_successful_product_record(record: dict[str, Any]) -> bool:
+    if is_invalid_product_record(record):
+        return False
     if not record.get("existence"):
         return False
     if float(record.get("price") or 0) <= 0:
         return False
     title = str(record.get("title") or "")
     if not title or title == "ERROR" or is_generic_page_title(title):
-        return False
-    if is_browser_network_error_page(title=title, page_text="", page_url=""):
         return False
     return True
 
@@ -2666,6 +2685,26 @@ class CrawlState:
             ) as invalid_fh:
                 for record_idx, product in enumerate(product_records):
                     validated, validation_error = validate_product_record(product)
+                    if validated and is_invalid_product_record(validated):
+                        invalid_fh.write(
+                            json.dumps(
+                                {
+                                    "url": url,
+                                    "product_id": validated.get("product_id") or product_id_from_url(url),
+                                    "error": "无效商品数据（网络错误页或不完整抓取），未写入 ES",
+                                    "title": validated.get("title"),
+                                    "date": datetime.now().replace(microsecond=0).isoformat(),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                        invalid_fh.flush()
+                        if record_idx == 0:
+                            primary_failed = True
+                        print(f"  失败: 无效商品数据，未保存: {validated.get('title')}")
+                        continue
+
                     if not validated:
                         invalid_fh.write(
                             json.dumps(
@@ -2852,15 +2891,16 @@ async def browser_worker(
                     {
                         "url": url,
                         "product_id": product_id_from_url(url),
-                        "error": f"连续 {retry_count} 次遇到验证码，跳过当前商品",
+                        "error": f"连续 {retry_count} 次遇到验证码，本批次跳过（下次运行可重试）",
                         "date": datetime.now().replace(microsecond=0).isoformat(),
                     },
                 )
                 await state.mark_url_done(failed=True)
-                await state.finish_url(url)
+                await state.release_url(url)
                 task_queue.task_done()
                 pending_task = None
-                print(f"[{worker_label}] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
+                reset_after_product = True
+                print(f"[{worker_label}] 当前商品验证码重试已达上限，本批次跳过，留待下次运行重试。")
         except (NetworkPageError, MissingPriceError, IncompleteFetchError) as exc:
             if pending_task is None:
                 continue
