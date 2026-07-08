@@ -118,6 +118,8 @@ PRIORITY_MIN_SOLD = int(os.environ.get("PRIORITY_MIN_SOLD", "1000") or "1000")
 
 # 只抓取 aliexpress.us 链接（跳过 .com）
 CRAWL_US_ONLY = os.environ.get("CRAWL_US_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+# 跳过产品索引里已有 doc 的 URL（默认开启，避免重复刷新、_count 只随新 doc 增长）
+SKIP_EXISTING_PRODUCTS = os.environ.get("SKIP_EXISTING_PRODUCTS", "1").strip().lower() in ("1", "true", "yes", "on")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -501,17 +503,32 @@ async def crawl_link_phases(
             print("[ES链接] 优先筛选阶段结束，开始抓取其余商品。")
 
 
-def upload_product(product: dict[str, Any]) -> bool:
-    """上传产品详情到 Elasticsearch 产品索引。"""
+def product_exists_in_es(url: str) -> bool:
+    """Check whether the product doc already exists in the product index."""
+    product_id = product_id_from_url(url)
+    if not product_id:
+        return False
+    source = source_from_url(normalize_crawl_url(url))
+    doc_id = product_doc_id(source, product_id)
+    check_url = f"http://{ES_HOST}:{ES_PORT}/{PRODUCT_INDEX_NAME}/_doc/{doc_id}"
+    try:
+        resp = requests.head(check_url, auth=(ES_USER, ES_PASSWORD), timeout=15)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def upload_product(product: dict[str, Any]) -> str:
+    """Upload product to ES. Returns: created | updated | skipped | failed."""
     if is_invalid_product_record(product):
         title = str(product.get("title") or "")[:80]
         print(f"  [上传跳过] 无效商品数据，不上传 ES: {title or product.get('product_id')}")
-        return False
+        return "skipped"
 
     product_id = str(product.get("product_id") or product_id_from_url(str(product.get("url") or ""))).strip()
     if not product_id:
         print("  [上传失败] 缺少 product_id")
-        return False
+        return "failed"
 
     doc_id = str(
         product.get("_id")
@@ -525,12 +542,16 @@ def upload_product(product: dict[str, Any]) -> bool:
     try:
         resp = requests.put(url, auth=(ES_USER, ES_PASSWORD), json=body, timeout=30)
         if resp.status_code in (200, 201):
-            print(f"  [上传成功] 索引={PRODUCT_INDEX_NAME} id={doc_id}")
-            return True
+            result = str(resp.json().get("result") or ("created" if resp.status_code == 201 else "updated"))
+            if result not in ("created", "updated"):
+                result = "updated"
+            note = "新建 doc，_count +1" if result == "created" else "更新已有 doc，_count 不变"
+            print(f"  [上传成功] 索引={PRODUCT_INDEX_NAME} id={doc_id} ({result}，{note})")
+            return result
         print(f"  [上传失败] id={doc_id} status={resp.status_code} body={resp.text[:300]}")
     except Exception as exc:
         print(f"  [上传失败] id={doc_id} error={exc}")
-    return False
+    return "failed"
 
 
 def load_progress() -> set[str]:
@@ -674,6 +695,25 @@ def to_float(value: Any, default: float = 0.0) -> float:
     if not match:
         return default
     return float(match.group(0))
+
+
+def pick_price_from_body_text(body_text: str) -> float:
+    """Fallback: parse the first USD price from visible page text."""
+    text = str(body_text or "")
+    if not text:
+        return 0.0
+    patterns = (
+        r"\$\s*(\d{1,6}(?:,\d{3})*(?:\.\d{1,2})?)",
+        r"US\s*\$\s*(\d{1,6}(?:,\d{3})*(?:\.\d{1,2})?)",
+        r"USD\s*(\d{1,6}(?:,\d{3})*(?:\.\d{1,2})?)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            value = to_float(match.group(1))
+            if value > 0:
+                return value
+    return 0.0
 
 
 def to_int(value: Any, default: int = 0) -> int:
@@ -1494,6 +1534,8 @@ def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[di
             price = to_float(offers.get("lowPrice") or offers.get("price") or 0)
     if price <= 0:
         price = to_float(dom_data.get("priceText", ""))
+    if price <= 0:
+        price = pick_price_from_body_text(str(dom_data.get("bodyText") or ""))
 
     # ---- currency: LD+JSON > API ----
     currency = "USD"
@@ -2292,8 +2334,14 @@ async def extract_dom_data(page: Page) -> dict[str, Any]:
             (document.querySelector('[data-pl="product-title"]') || {}).innerText?.trim() ||
             document.title ||
             '';
-          const priceEl = document.querySelector('[class*="current--"], [class*="current--"] span');
-          const priceText = priceEl ? priceEl.innerText.trim() : '';
+          const priceEl = document.querySelector(
+            '[class*="current--"], [class*="current--"] span, [class*="price-default--"], [class*="price--"] span, [data-pl="product-price"]'
+          );
+          let priceText = priceEl ? priceEl.innerText.trim() : '';
+          if (!priceText) {
+            const priceMatch = bodyText.match(/(?:US\\s*)?\\$\\s*\\d+(?:\\.\\d{1,2})?/);
+            if (priceMatch) priceText = priceMatch[0];
+          }
           const breadItems = [];
           document.querySelectorAll(
             '[class*="breadcrumb"] a, [class*="breadCrumb"] a, nav[aria-label="breadcrumb"] a'
@@ -2334,7 +2382,7 @@ async def extract_dom_data(page: Page) -> dict[str, Any]:
             });
             if (propName && values.length) skuOptions.push({ id: rowId, name: propName, values });
           });
-          return { title, priceText, categories: breadItems, rating, reviews, soldCount, skuOptions };
+          return { title, priceText, bodyText, categories: breadItems, rating, reviews, soldCount, skuOptions };
         }"""
     )
     images = await page.evaluate(
@@ -2512,10 +2560,19 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         if sku_module and not api_result.get("SKU"):
             api_result["skuModule"] = sku_module
         price_component = run_params.get("priceComponent") or {}
+        if price_component:
+            existing_price_component = api_result.get("priceComponent") or {}
+            if isinstance(existing_price_component, dict):
+                api_result["priceComponent"] = {**existing_price_component, **price_component}
+            else:
+                api_result["priceComponent"] = price_component
         if price_component.get("skuPriceList"):
             api_result.setdefault("skuModule", {})
             if isinstance(api_result["skuModule"], dict):
                 api_result["skuModule"]["skuPriceList"] = price_component["skuPriceList"]
+        price_module = run_params.get("priceModule") or {}
+        if price_module and not api_result.get("priceModule"):
+            api_result["priceModule"] = price_module
 
     # ---- 第五步：如果有 API 数据，尝试获取远程描述 ----
     if api_data:
@@ -2609,6 +2666,10 @@ class CrawlState:
         self.failed = 0
         self.skipped = 0
         self.completed = 0
+        self.es_created = 0
+        self.es_updated = 0
+        self.es_upload_failed = 0
+        self.es_skipped_existing = 0
 
     async def is_processed(self, url: str) -> bool:
         async with self.lock:
@@ -2628,6 +2689,8 @@ class CrawlState:
                 return False, "duplicate"
             if product_id and product_id in self.in_progress_product_ids:
                 return False, "product_busy"
+            if SKIP_EXISTING_PRODUCTS and product_exists_in_es(url):
+                return False, "already_in_es"
             self.in_progress.add(url)
             if product_id:
                 self.in_progress_product_ids.add(product_id)
@@ -2649,9 +2712,20 @@ class CrawlState:
             self.processed_urls.add(url)
             save_progress(self.processed_urls)
 
-    async def mark_skipped(self) -> None:
+    async def mark_skipped(self, *, already_in_es: bool = False) -> None:
         async with self.stats_lock:
             self.skipped += 1
+            if already_in_es:
+                self.es_skipped_existing += 1
+
+    async def mark_es_upload(self, result: str) -> None:
+        async with self.stats_lock:
+            if result == "created":
+                self.es_created += 1
+            elif result == "updated":
+                self.es_updated += 1
+            elif result == "failed":
+                self.es_upload_failed += 1
 
     async def mark_url_done(self, *, success: bool = False, failed: bool = False) -> None:
         async with self.stats_lock:
@@ -2679,10 +2753,12 @@ class CrawlState:
         invalid_path: Path,
         url: str,
         product_records: list[dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, bool | str | None]:
         saved_primary = False
         primary_success = False
         primary_failed = False
+        primary_uploaded = False
+        primary_upload_result: str | None = None
         async with self.file_lock:
             with products_path.open("a", encoding="utf-8") as products_fh, invalid_path.open(
                 "a", encoding="utf-8"
@@ -2730,10 +2806,14 @@ class CrawlState:
 
                     products_fh.write(json.dumps(validated, ensure_ascii=False) + "\n")
                     products_fh.flush()
-                    upload_product(validated)
+                    upload_result = upload_product(validated)
+                    await self.mark_es_upload(upload_result)
                     if record_idx == 0:
                         saved_primary = True
                         primary_success = bool(validated.get("existence"))
+                        if upload_result in ("created", "updated"):
+                            primary_uploaded = True
+                            primary_upload_result = upload_result
                         if primary_success:
                             desc_len = len(str(validated.get("description") or ""))
                             print(
@@ -2752,7 +2832,13 @@ class CrawlState:
                         )
 
         failed = primary_failed or (not saved_primary and bool(product_records))
-        await self.mark_url_done(success=primary_success, failed=failed)
+        await self.mark_url_done(success=primary_success and primary_uploaded, failed=failed)
+        return {
+            "primary_uploaded": primary_uploaded,
+            "primary_upload_result": primary_upload_result,
+            "saved_primary": saved_primary,
+            "primary_failed": primary_failed,
+        }
 
 
 UrlTask = tuple[str, int, int, int, int]
@@ -2814,6 +2900,10 @@ async def browser_worker(
                     task_queue.task_done()
                     await asyncio.sleep(0.3)
                     continue
+                if claim_reason == "already_in_es":
+                    await state.mark_skipped(already_in_es=True)
+                    task_queue.task_done()
+                    continue
                 await state.mark_skipped()
                 task_queue.task_done()
                 continue
@@ -2836,8 +2926,21 @@ async def browser_worker(
                 if not product_records:
                     raise BrowserRestartRequired("未获取到商品数据，不保存")
 
-                await state.save_product_records(products_path, invalid_path, url, product_records)
-                await state.finish_url(url)
+                save_result = await state.save_product_records(products_path, invalid_path, url, product_records)
+                if save_result["primary_uploaded"]:
+                    await state.finish_url(url)
+                else:
+                    await state.append_invalid(
+                        invalid_path,
+                        {
+                            "url": url,
+                            "product_id": product_id_from_url(url),
+                            "error": "页面已抓取但 ES 未写入（上传失败或记录无效），留待下次重试",
+                            "date": datetime.now().replace(microsecond=0).isoformat(),
+                        },
+                    )
+                    await state.release_url(url)
+                    print(f"  未写入 ES，URL 未标记为已处理，下次运行可重试: {url}")
                 task_queue.task_done()
                 pending_task = None
                 reset_after_product = True
@@ -3055,6 +3158,10 @@ async def main_async() -> None:
     else:
         print("抓取策略: 全部链接（未启用优先筛选）")
     print(f"抓取站点: {crawl_scope_label()}")
+    if SKIP_EXISTING_PRODUCTS:
+        print("跳过策略: 产品索引已有 doc 的 URL 不再抓取（默认开启，_count 只随新建增长）")
+    else:
+        print("跳过策略: SKIP_EXISTING_PRODUCTS=0，已存在 doc 会被更新（_count 可能不变）")
     if MAX_PRODUCTS > 0:
         print(f"本地试跑: 最多处理 {MAX_PRODUCTS} 条商品")
     print()
@@ -3074,6 +3181,11 @@ async def main_async() -> None:
     print(f"失败: {state.failed}")
     print(f"已完成: {state.completed}")
     print(f"跳过已处理: {state.skipped}")
+    print(f"ES 新建 doc: {state.es_created}（_count 增加）")
+    print(f"ES 更新 doc: {state.es_updated}（_count 不变）")
+    print(f"ES 上传失败: {state.es_upload_failed}")
+    if SKIP_EXISTING_PRODUCTS:
+        print(f"ES 已有 doc 跳过: {state.es_skipped_existing}")
     print(f"详情文件: {products_path}")
     print(f"失败文件: {invalid_path}")
     print(f"进度文件: {PROGRESS_FILE}")
