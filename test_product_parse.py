@@ -105,6 +105,28 @@ class ProductParseTestCase(unittest.TestCase):
             )
         )
 
+    def test_missing_available_price_detection(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(
+            mod.is_missing_available_price(
+                {"existence": True, "price": 0.0, "title": "Sample Product"},
+            )
+        )
+        self.assertFalse(
+            mod.is_missing_available_price(
+                {"existence": False, "price": 0.0, "title": "Unavailable Product 123"},
+            )
+        )
+        self.assertFalse(
+            mod.is_missing_available_price(
+                {"existence": True, "price": 9.99, "title": "Sample Product"},
+            )
+        )
+
     def test_unavailable_product_detects_generic_title(self):
         import importlib.util
 
@@ -225,8 +247,50 @@ class ProductParseTestCase(unittest.TestCase):
         self.assertIn("original_url_no_longer_exists", validated["summary"])
         self.assertIn("3256804319874517", validated["summary"])
 
-        records = mod.finalize_fetch_records({"product_id": "3256804319874517"}, info)
+        records = mod.finalize_fetch_records(
+            {
+                "existence": True,
+                "price": 9.99,
+                "title": "Pet Grooming Brush",
+                "product_id": "3256804319874517",
+            },
+            info,
+        )
         self.assertEqual(len(records), 2)
+
+    def test_finalize_fetch_records_skips_superseded_for_incomplete_primary(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        original = "https://www.aliexpress.com/item/1005004506189269.html"
+        final = "https://www.aliexpress.us/item/3256804319874517.html?gatewayAdapt=glo2usa"
+        info = mod.build_redirect_info(original, final)
+        bad_primary = {
+            "existence": True,
+            "price": 0.0,
+            "title": "This site can\u2019t be reached",
+            "product_id": "3256804319874517",
+        }
+        records = mod.finalize_fetch_records(bad_primary, info)
+        self.assertEqual(len(records), 1)
+        self.assertFalse(mod.should_save_superseded_redirect(bad_primary))
+
+        good_primary = {
+            "existence": True,
+            "price": 9.99,
+            "title": "Pet Grooming Brush",
+            "product_id": "3256804319874517",
+        }
+        records = mod.finalize_fetch_records(good_primary, info)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(mod.should_save_superseded_redirect(good_primary))
+
+        unavailable = mod.make_empty_record(final)
+        records = mod.finalize_fetch_records(unavailable, info)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(mod.should_save_superseded_redirect(unavailable))
 
     def test_build_redirect_info_for_com_to_us_same_product_id(self):
         import importlib.util
@@ -276,6 +340,32 @@ class ProductParseTestCase(unittest.TestCase):
         label = mod.priority_filter_label()
         self.assertIn("price<", label)
         self.assertIn("rating>=", label)
+
+    def test_build_url_query_us_only(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.CRAWL_US_ONLY = True
+        query = mod.build_url_query()
+        must = query["bool"]["must"]
+        self.assertTrue(any(item.get("exists", {}).get("field") == "url" for item in must))
+        self.assertTrue(
+            any(
+                item.get("bool", {}).get("should")
+                and any(
+                    clause.get("term", {}).get("source") == "aliexpress.us"
+                    for clause in item["bool"]["should"]
+                )
+                for item in must
+            )
+        )
+        self.assertEqual(
+            mod.normalize_crawl_url("https://www.aliexpress.com/item/1234567890.html"),
+            "https://www.aliexpress.us/item/1234567890.html",
+        )
+        self.assertTrue(mod.is_us_product_url("https://www.aliexpress.us/item/1.html"))
 
 
 if __name__ == "__main__":

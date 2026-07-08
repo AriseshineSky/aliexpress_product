@@ -116,6 +116,9 @@ PRIORITY_MIN_RATING = float(os.environ.get("PRIORITY_MIN_RATING", "4.4") or "4.4
 PRIORITY_MIN_REVIEWS = int(os.environ.get("PRIORITY_MIN_REVIEWS", "1000") or "1000")
 PRIORITY_MIN_SOLD = int(os.environ.get("PRIORITY_MIN_SOLD", "1000") or "1000")
 
+# 只抓取 aliexpress.us 链接（跳过 .com）
+CRAWL_US_ONLY = os.environ.get("CRAWL_US_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -143,6 +146,14 @@ class BrowserRestartRequired(RuntimeError):
 
 class NetworkPageError(RuntimeError):
     """Chrome network error page; do not save product data."""
+
+
+class MissingPriceError(RuntimeError):
+    """Available product fetched without a usable price; do not save product data."""
+
+
+class IncompleteFetchError(RuntimeError):
+    """Product page response is incomplete or invalid; retry later."""
 
 
 def is_browser_closed_error(exc: BaseException) -> bool:
@@ -302,6 +313,18 @@ def build_url_query(*, priority: bool = False, exclude_priority: bool = False) -
     exclude_priority=True: everything that does NOT match priority (phase 2)
     """
     base_must: list[dict[str, Any]] = [{"exists": {"field": "url"}}]
+    if CRAWL_US_ONLY:
+        base_must.append(
+            {
+                "bool": {
+                    "should": [
+                        {"term": {"source": "aliexpress.us"}},
+                        {"wildcard": {"url": "*aliexpress.us/*"}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+        )
     priority_must: list[dict[str, Any]] = [
         {"range": {"price": {"lt": PRIORITY_MAX_PRICE}}},
         {"range": {"rating": {"gte": PRIORITY_MIN_RATING}}},
@@ -325,6 +348,29 @@ def priority_filter_label() -> str:
         f"price<{PRIORITY_MAX_PRICE}, rating>={PRIORITY_MIN_RATING}, "
         f"reviews>={PRIORITY_MIN_REVIEWS}, sold_count>={PRIORITY_MIN_SOLD}"
     )
+
+
+def crawl_scope_label() -> str:
+    return "仅 aliexpress.us" if CRAWL_US_ONLY else "aliexpress.com + aliexpress.us"
+
+
+def is_us_product_url(url: str) -> bool:
+    host = urlparse(str(url or "")).netloc.lower()
+    return host.endswith("aliexpress.us")
+
+
+def normalize_crawl_url(url: str) -> str:
+    """Ensure US-only crawls stay on aliexpress.us URLs."""
+    link = normalize_https_url(str(url or "").strip())
+    if not link:
+        return link
+    if CRAWL_US_ONLY and not is_us_product_url(link):
+        parsed = urlparse(link)
+        product_id = product_id_from_url(link)
+        if product_id:
+            return f"https://www.aliexpress.us/item/{product_id}.html"
+        return link.replace("aliexpress.com", "aliexpress.us")
+    return link
 
 
 def get_total_link_count(*, priority: bool = False, exclude_priority: bool = False) -> int:
@@ -371,8 +417,10 @@ def load_link_batch(
     seen: set[str] = set()
     for hit in hits:
         source = hit.get("_source") or {}
-        link = str(source.get("url") or "").strip()
+        link = normalize_crawl_url(str(source.get("url") or "").strip())
         if not link or link in seen:
+            continue
+        if CRAWL_US_ONLY and not is_us_product_url(link):
             continue
         seen.add(link)
         links.append(link)
@@ -696,6 +744,59 @@ def is_browser_network_error_page(*, title: str, page_text: str, page_url: str) 
     return bool(BROWSER_NETWORK_ERROR_TITLE_RE.search(combined))
 
 
+def is_missing_available_price(record: dict[str, Any]) -> bool:
+    """True when a product looks available but no price was extracted."""
+    return bool(record.get("existence")) and float(record.get("price") or 0) <= 0
+
+
+def raise_if_missing_available_price(record: dict[str, Any], *, url: str) -> None:
+    if is_missing_available_price(record):
+        raise MissingPriceError(f"商品可售但价格为 0，不保存: {url}")
+
+
+def is_successful_product_record(record: dict[str, Any]) -> bool:
+    if not record.get("existence"):
+        return False
+    if float(record.get("price") or 0) <= 0:
+        return False
+    title = str(record.get("title") or "")
+    if not title or title == "ERROR" or is_generic_page_title(title):
+        return False
+    if is_browser_network_error_page(title=title, page_text="", page_url=""):
+        return False
+    return True
+
+
+def is_genuine_unavailable_record(record: dict[str, Any]) -> bool:
+    if record.get("existence"):
+        return False
+    title = str(record.get("title") or "")
+    return title.startswith(MISSING_PRODUCT_TITLE_PREFIX)
+
+
+def should_save_superseded_redirect(primary: dict[str, Any]) -> bool:
+    """Only mark the original .com URL superseded after a real fetch result."""
+    return is_successful_product_record(primary) or is_genuine_unavailable_record(primary)
+
+
+def raise_if_incomplete_fetch_record(
+    record: dict[str, Any],
+    *,
+    url: str,
+    page_text: str = "",
+    page_url: str = "",
+) -> None:
+    title = str(record.get("title") or "")
+    if is_browser_network_error_page(title=title, page_text=page_text, page_url=page_url):
+        raise NetworkPageError(f"浏览器网络错误页，不保存商品: {title or url}")
+    if is_missing_available_price(record):
+        raise MissingPriceError(f"商品可售但价格为 0，不保存: {url}")
+    if not title or title == "ERROR":
+        raise IncompleteFetchError(f"未提取到有效标题，不保存: {url}")
+    if record.get("existence") and is_generic_page_title(title):
+        raise IncompleteFetchError(f"页面标题无效，不保存: {title}")
+
+
 def clean_html(html: str) -> str:
     return clean_product_description(html)
 
@@ -895,7 +996,7 @@ def make_superseded_record(redirect_info: dict[str, str]) -> dict[str, Any]:
 
 def finalize_fetch_records(record: dict[str, Any], redirect_info: dict[str, str] | None) -> list[dict[str, Any]]:
     records = [record]
-    if redirect_info:
+    if redirect_info and should_save_superseded_redirect(record):
         records.append(make_superseded_record(redirect_info))
     return records
 
@@ -2358,6 +2459,10 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         raise
     except NetworkPageError:
         raise
+    except MissingPriceError:
+        raise
+    except IncompleteFetchError:
+        raise
     except Exception as exc:
         print(f"  [API] 页面加载失败，降级使用 LD+JSON: {exc}")
 
@@ -2426,12 +2531,12 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
     await raise_if_risk_control_page(page)
 
     record = build_standard_record(api_data, ld_json_list, dom_data, save_url)
-    if is_browser_network_error_page(
-        title=str(record.get("title") or ""),
+    raise_if_incomplete_fetch_record(
+        record,
+        url=save_url,
         page_text=str(page_text or ""),
         page_url=page.url or "",
-    ):
-        raise NetworkPageError(f"浏览器网络错误页，不保存商品: {record.get('title')}")
+    )
 
     if is_unavailable_product_page(
         api_data=api_data,
@@ -2443,16 +2548,17 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         print(f"  重定向目标页不可用（下架/404）: {save_url}")
         return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
 
-    if not record.get("title") or record["title"] == "ERROR":
-        await raise_if_risk_control_page(page)
-        print(f"  未提取到有效标题：{save_url}")
-        return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
-
     validated, error = validate_product_record(record)
     if not validated:
         await raise_if_risk_control_page(page)
-        print(f"  格式校验失败：{error}")
-        return finalize_fetch_records(make_empty_record(save_url, redirect_info=redirect_info), redirect_info)
+        raise IncompleteFetchError(f"格式校验失败，不保存: {error}")
+
+    raise_if_incomplete_fetch_record(
+        validated,
+        url=save_url,
+        page_text=str(page_text or ""),
+        page_url=page.url or "",
+    )
 
     validated = apply_redirect_metadata(validated, redirect_info)
     if redirect_info:
@@ -2460,10 +2566,11 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
             f"  已按重定向商品保存: [{validated.get('source')}] {validated.get('product_id')} "
             f"(原请求 [{redirect_info['original_source']}] {redirect_info['original_product_id']})"
         )
-        print(
-            f"  已标记原 URL 不存在: [{redirect_info['original_source']}] "
-            f"{redirect_info['original_product_id']}"
-        )
+        if should_save_superseded_redirect(validated):
+            print(
+                f"  已标记原 URL 不存在: [{redirect_info['original_source']}] "
+                f"{redirect_info['original_product_id']}"
+            )
     return finalize_fetch_records(validated, redirect_info)
 
 
@@ -2696,6 +2803,10 @@ async def browser_worker(
                 raise
             except NetworkPageError:
                 raise
+            except MissingPriceError:
+                raise
+            except IncompleteFetchError:
+                raise
             except Exception as exc:
                 if is_browser_closed_error(exc):
                     raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
@@ -2750,7 +2861,7 @@ async def browser_worker(
                 task_queue.task_done()
                 pending_task = None
                 print(f"[{worker_label}] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
-        except NetworkPageError as exc:
+        except (NetworkPageError, MissingPriceError, IncompleteFetchError) as exc:
             if pending_task is None:
                 continue
 
@@ -2758,7 +2869,7 @@ async def browser_worker(
             network_restart_counts[url] = network_restart_counts.get(url, 0) + 1
             retry_count = network_restart_counts[url]
             print(
-                f"[{worker_label}] {exc}，当前商品网络重试 {retry_count}/"
+                f"[{worker_label}] {exc}，当前商品重试 {retry_count}/"
                 f"{MAX_NETWORK_RESTARTS_PER_URL}。"
             )
             if retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
@@ -2767,7 +2878,7 @@ async def browser_worker(
                 pending_task = None
                 reset_after_product = True
                 print(
-                    f"[{worker_label}] 本批次网络重试已达上限，未写入 ES，留待下次运行重试: {url}"
+                    f"[{worker_label}] 本批次重试已达上限，未写入 ES，留待下次运行重试: {url}"
                 )
             else:
                 print(
@@ -2899,6 +3010,7 @@ async def main_async() -> None:
         print(f"优先条件: {priority_filter_label()}")
     else:
         print("抓取策略: 全部链接（未启用优先筛选）")
+    print(f"抓取站点: {crawl_scope_label()}")
     if MAX_PRODUCTS > 0:
         print(f"本地试跑: 最多处理 {MAX_PRODUCTS} 条商品")
     print()
