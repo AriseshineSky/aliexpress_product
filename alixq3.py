@@ -1599,12 +1599,16 @@ def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[di
     if variants:
         print(f"  [SKU] options={len(options or [])} variants={len(variants)}")
 
+    page_ready = bool(title and title != "ERROR") and not is_generic_page_title(title)
+    if page_ready and is_browser_network_error_page(title=title, page_text=description, page_url=url):
+        page_ready = False
+
     return {
         "date": datetime.now().replace(microsecond=0).isoformat(),
         "url": normalize_https_url(url),
         "source": source,
         "product_id": pid,
-        "existence": bool(title and title != "ERROR"),
+        "existence": page_ready,
         "title": title,
         "title_en": None,
         "description": description,
