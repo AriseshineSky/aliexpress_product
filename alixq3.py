@@ -100,6 +100,7 @@ CAPTCHA_MAX_ROUNDS = 30
 CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("CAPTCHA_RECOVERY_ROUNDS", "5") or "5")
 CAPTCHA_MANUAL_PAUSE_SECONDS = int(os.environ.get("CAPTCHA_MANUAL_PAUSE_SECONDS", "8") or "8")
 MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("MAX_CAPTCHA_RESTARTS_PER_URL", "3") or "3")
+MAX_NETWORK_RESTARTS_PER_URL = int(os.environ.get("MAX_NETWORK_RESTARTS_PER_URL", "3") or "3")
 BROWSER_RESTART_DELAY_SECONDS = int(os.environ.get("BROWSER_RESTART_DELAY_SECONDS", "5") or "5")
 WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
 
@@ -130,6 +131,10 @@ PROFILE_LOCK_FILES = (
 
 class BrowserRestartRequired(RuntimeError):
     pass
+
+
+class NetworkPageError(RuntimeError):
+    """Chrome network error page; do not save product data."""
 
 
 def is_browser_closed_error(exc: BaseException) -> bool:
@@ -527,6 +532,33 @@ NOT_FOUND_PAGE_MARKERS = (
     "this product is no longer available",
     "page_not_found_notice",
 )
+BROWSER_NETWORK_ERROR_MARKERS = (
+    "this site can't be reached",
+    "this page isn't working",
+    "this webpage is not available",
+    "this site is unreachable",
+    "err_connection_refused",
+    "err_connection_reset",
+    "err_connection_timed_out",
+    "err_connection_closed",
+    "err_proxy_connection_failed",
+    "err_name_not_resolved",
+    "err_timed_out",
+    "err_internet_disconnected",
+    "err_address_unreachable",
+    "err_network_changed",
+    "err_ssl_protocol_error",
+    "no internet",
+    "dns_probe_finished",
+)
+
+
+def is_browser_network_error_page(*, title: str, page_text: str, page_url: str) -> bool:
+    """Detect Chromium built-in network error pages (not AliExpress content)."""
+    if str(page_url or "").lower().startswith("chrome-error://"):
+        return True
+    combined = f"{title}\n{page_text}".lower()
+    return any(marker in combined for marker in BROWSER_NETWORK_ERROR_MARKERS)
 
 
 def clean_html(html: str) -> str:
@@ -1379,6 +1411,28 @@ async def raise_if_risk_control_page(page: Page) -> None:
         raise BrowserRestartRequired("页面仍在风控/验证状态，不保存商品数据")
 
 
+async def raise_if_network_error_page(page: Page) -> None:
+    """Raise when the browser shows a network error page instead of the product."""
+    try:
+        page_url = page.url or ""
+        title = await page.title()
+        page_text = await page.evaluate(
+            "() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 4000) : ''"
+        )
+        if is_browser_network_error_page(
+            title=str(title or ""),
+            page_text=str(page_text or ""),
+            page_url=page_url,
+        ):
+            label = str(title or "").strip() or page_url[:120]
+            raise NetworkPageError(f"浏览器网络错误页，不保存商品: {label}")
+    except NetworkPageError:
+        raise
+    except Exception as exc:
+        if is_browser_closed_error(exc):
+            raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
+
+
 async def navigate_product_page(page: Page, full_url: str, captcha_state: dict[str, bool]) -> None:
     """打开商品页并在风控页时重试导航，直到进入正常商品页或达到重试上限。"""
     for attempt in range(1, 4):
@@ -2167,8 +2221,12 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
             print("  [API] 未拦截到有效 pdp 接口，降级使用 LD+JSON")
     except BrowserRestartRequired:
         raise
+    except NetworkPageError:
+        raise
     except Exception as exc:
         print(f"  [API] 页面加载失败，降级使用 LD+JSON: {exc}")
+
+    await raise_if_network_error_page(page)
 
     # ---- 第四步：提取 LD+JSON + DOM 数据 ----
     ld_json_list = await extract_ld_json(page)
@@ -2229,9 +2287,16 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
         print("  [重定向] 将按最终 URL 的商品信息保存")
 
     page_text = await page.evaluate("() => (document.body && document.body.innerText) ? document.body.innerText.slice(0, 8000) : ''")
+    await raise_if_network_error_page(page)
     await raise_if_risk_control_page(page)
 
     record = build_standard_record(api_data, ld_json_list, dom_data, save_url)
+    if is_browser_network_error_page(
+        title=str(record.get("title") or ""),
+        page_text=str(page_text or ""),
+        page_url=page.url or "",
+    ):
+        raise NetworkPageError(f"浏览器网络错误页，不保存商品: {record.get('title')}")
 
     if is_unavailable_product_page(
         api_data=api_data,
@@ -2437,6 +2502,7 @@ async def browser_worker(
 ) -> None:
     worker_label = f"Worker-{worker_id}"
     captcha_restart_counts: dict[str, int] = {}
+    network_restart_counts: dict[str, int] = {}
     pending_task: UrlTask | None = None
     print(f"[{worker_label}] 启动")
 
@@ -2493,6 +2559,8 @@ async def browser_worker(
                 await sleep()
             except BrowserRestartRequired:
                 raise
+            except NetworkPageError:
+                raise
             except Exception as exc:
                 if is_browser_closed_error(exc):
                     raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
@@ -2547,6 +2615,35 @@ async def browser_worker(
                 task_queue.task_done()
                 pending_task = None
                 print(f"[{worker_label}] 当前商品连续遇到验证码，已记录失败并跳到下一条。")
+        except NetworkPageError as exc:
+            if pending_task is None:
+                continue
+
+            url = pending_task[0]
+            network_restart_counts[url] = network_restart_counts.get(url, 0) + 1
+            retry_count = network_restart_counts[url]
+            print(
+                f"[{worker_label}] {exc}，当前商品网络重试 {retry_count}/"
+                f"{MAX_NETWORK_RESTARTS_PER_URL}。"
+            )
+            if retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
+                await state.release_url(url)
+                task_queue.task_done()
+                pending_task = None
+                reset_after_product = True
+                print(
+                    f"[{worker_label}] 本批次网络重试已达上限，未写入 ES，留待下次运行重试: {url}"
+                )
+            else:
+                print(
+                    f"[{worker_label}] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重试当前商品"
+                    + (
+                        "（Webshare rotate 代理将分配新 IP）"
+                        if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
+                        else ""
+                    )
+                    + "。"
+                )
         finally:
             await close_browser_session(browser, context, worker_id)
 

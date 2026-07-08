@@ -70,6 +70,34 @@ class ProductParseTestCase(unittest.TestCase):
         self.assertTrue(mod.is_captcha_text("Unusual traffic from your network"))
         self.assertFalse(mod.is_captcha_text("Pet Grooming Brush for dogs"))
 
+    def test_browser_network_error_page_detection(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(
+            mod.is_browser_network_error_page(
+                title="This site can't be reached",
+                page_text="Check any cables and reboot any routers, modems, or other network devices.",
+                page_url="https://www.aliexpress.us/item/123.html",
+            )
+        )
+        self.assertTrue(
+            mod.is_browser_network_error_page(
+                title="",
+                page_text="",
+                page_url="chrome-error://chromewebdata/",
+            )
+        )
+        self.assertFalse(
+            mod.is_browser_network_error_page(
+                title="Pet Grooming Brush for dogs",
+                page_text="Add to cart",
+                page_url="https://www.aliexpress.us/item/123.html",
+            )
+        )
+
     def test_unavailable_product_detects_generic_title(self):
         import importlib.util
 
