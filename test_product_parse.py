@@ -97,6 +97,13 @@ class ProductParseTestCase(unittest.TestCase):
                 page_url="https://www.aliexpress.us/item/123.html",
             )
         )
+        self.assertTrue(
+            mod.is_browser_network_error_page(
+                title="This site can\u2019t be reached",
+                page_text="Check any cables and reboot any routers, modems, or other network devices.",
+                page_url="https://www.aliexpress.com/item/123.html",
+            )
+        )
 
     def test_unavailable_product_detects_generic_title(self):
         import importlib.util

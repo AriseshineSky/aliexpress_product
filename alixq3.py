@@ -672,14 +672,28 @@ BROWSER_NETWORK_ERROR_MARKERS = (
     "no internet",
     "dns_probe_finished",
 )
+BROWSER_NETWORK_ERROR_TITLE_RE = re.compile(
+    r"this site can.?t be reached|this page isn.?t working|this webpage is not available",
+    re.I,
+)
+
+
+def normalize_match_text(text: str) -> str:
+    """Normalize text for marker matching (Chrome often uses curly apostrophes)."""
+    normalized = str(text or "").lower()
+    for ch in ("\u2019", "\u2018", "\u02bc", "\u0060"):
+        normalized = normalized.replace(ch, "'")
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def is_browser_network_error_page(*, title: str, page_text: str, page_url: str) -> bool:
     """Detect Chromium built-in network error pages (not AliExpress content)."""
     if str(page_url or "").lower().startswith("chrome-error://"):
         return True
-    combined = f"{title}\n{page_text}".lower()
-    return any(marker in combined for marker in BROWSER_NETWORK_ERROR_MARKERS)
+    combined = normalize_match_text(f"{title}\n{page_text}")
+    if any(marker in combined for marker in BROWSER_NETWORK_ERROR_MARKERS):
+        return True
+    return bool(BROWSER_NETWORK_ERROR_TITLE_RE.search(combined))
 
 
 def clean_html(html: str) -> str:
