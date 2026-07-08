@@ -20,6 +20,7 @@ img/
 
 # Playwright
 .ms-playwright/
+.playwright-mcp/
 playwright-report/
 test-results/
 
