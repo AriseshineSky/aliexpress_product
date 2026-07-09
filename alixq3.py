@@ -1186,6 +1186,59 @@ def parse_images_from_api(api_data: dict[str, Any]) -> str:
     return ";".join(images) if images else PLACEHOLDER_IMAGE
 
 
+def image_dedupe_key(url: str) -> str:
+    """Normalize image URL for deduplication (ignore query params and size suffixes)."""
+    text = normalize_image_url(str(url or "").strip())
+    if not text:
+        return ""
+    text = text.split("?", 1)[0]
+    text = re.sub(r"_\.avif$", "", text, flags=re.I)
+    text = re.sub(r"_(?:80x80|120x120|220x220|960x960)q75\.jpg.*$", "", text, flags=re.I)
+    return text.lower()
+
+
+def collect_product_images(
+    api_data: dict[str, Any] | None,
+    ld_product: dict[str, Any],
+    dom_data: dict[str, Any],
+) -> str:
+    """Pick product images with API > DOM > LD+JSON fallback and URL dedup."""
+    sources: list[list[str]] = []
+
+    if api_data:
+        api_imgs = parse_images_from_api(api_data)
+        if api_imgs != PLACEHOLDER_IMAGE:
+            sources.append([part.strip() for part in api_imgs.split(";") if part.strip()])
+
+    dom_imgs = [
+        normalize_image_url(str(img or ""))
+        for img in (dom_data.get("images") or [])
+        if normalize_image_url(str(img or ""))
+    ]
+    if dom_imgs:
+        sources.append(dom_imgs)
+
+    if ld_product.get("image"):
+        ld_imgs = ld_product["image"] if isinstance(ld_product["image"], list) else [ld_product["image"]]
+        ld_normalized = [normalize_image_url(str(img or "")) for img in ld_imgs if normalize_image_url(str(img or ""))]
+        if ld_normalized:
+            sources.append(ld_normalized)
+
+    for candidates in sources:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for img in candidates:
+            key = image_dedupe_key(img)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(normalize_image_url(img))
+        if unique:
+            return ";".join(unique)
+
+    return PLACEHOLDER_IMAGE
+
+
 def get_currency_from_api(api_data: dict[str, Any]) -> str:
     """从 API 数据推断货币（新结构: data.result.GLOBAL_DATA.currencyCode / PRICE）"""
     result = _get_api_result(api_data)
@@ -1544,21 +1597,8 @@ def build_standard_record(api_data: dict[str, Any] | None, ld_json_list: list[di
     if currency == "USD" and api_result:
         currency = get_currency_from_api(api_data) if api_data else "USD"
 
-    # ---- images: LD+JSON > DOM > API ----
-    images = PLACEHOLDER_IMAGE
-    if ld_product.get("image"):
-        ld_imgs = ld_product["image"] if isinstance(ld_product["image"], list) else [ld_product["image"]]
-        imgs = [normalize_image_url(img) for img in ld_imgs if img]
-        if imgs:
-            images = ";".join(imgs)
-    if images == PLACEHOLDER_IMAGE and dom_data.get("images"):
-        dom_imgs = [normalize_image_url(img) for img in dom_data["images"]]
-        if dom_imgs:
-            images = ";".join(dom_imgs)
-    if images == PLACEHOLDER_IMAGE and api_result:
-        api_imgs = parse_images_from_api(api_data) if api_data else PLACEHOLDER_IMAGE
-        if api_imgs != PLACEHOLDER_IMAGE:
-            images = api_imgs
+    # ---- images: API > DOM > LD+JSON (deduped) ----
+    images = collect_product_images(api_data, ld_product, dom_data)
 
     # ---- rating: LD+JSON > API > DOM ----
     rating = None

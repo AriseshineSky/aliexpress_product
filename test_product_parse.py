@@ -380,6 +380,64 @@ class ProductParseTestCase(unittest.TestCase):
         self.assertIn("price<", label)
         self.assertIn("rating>=", label)
 
+    def test_collect_product_images_prefers_api_over_incomplete_ld_json(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        api_data = {
+            "data": {
+                "result": {
+                    "HEADER_IMAGE_PC": {
+                        "imagePathList": [
+                            "https://ae-pic-a1.aliexpress-media.com/kf/S3d1baf91dd8e47c7b5a6af72159c2352G.jpg?has_lang=1&ver=2",
+                            "https://ae-pic-a1.aliexpress-media.com/kf/Sff22a9e49ef74e8a9a8f0e45198adba6U.jpg?has_lang=1&ver=2",
+                            "https://ae-pic-a1.aliexpress-media.com/kf/S92ca4f65e2b64b978c0e9921abc7adebM.jpg?has_lang=1&ver=2",
+                            "https://ae-pic-a1.aliexpress-media.com/kf/S0403274f8e314045aa63d01c8ef94db7B.jpg?has_lang=1&ver=2",
+                        ]
+                    }
+                }
+            }
+        }
+        ld_product = {
+            "image": [
+                "https://ae-pic-a1.aliexpress-media.com/kf/S3d1baf91dd8e47c7b5a6af72159c2352G.jpg?has_lang=1&ver=2",
+                "https://ae-pic-a1.aliexpress-media.com/kf/S3d1baf91dd8e47c7b5a6af72159c2352G.jpg?has_lang=1&ver=2",
+                "https://ae-pic-a1.aliexpress-media.com/kf/Sff22a9e49ef74e8a9a8f0e45198adba6U.jpg?has_lang=1&ver=2",
+            ]
+        }
+        dom_data = {
+            "images": [
+                "https://ae-pic-a1.aliexpress-media.com/kf/S3d1baf91dd8e47c7b5a6af72159c2352G.jpg",
+                "https://ae-pic-a1.aliexpress-media.com/kf/Sff22a9e49ef74e8a9a8f0e45198adba6U.jpg",
+            ]
+        }
+        images = mod.collect_product_images(api_data, ld_product, dom_data).split(";")
+        self.assertEqual(len(images), 4)
+        self.assertIn("S3d1baf91dd8e47c7b5a6af72159c2352G.jpg", images[0])
+        self.assertIn("S92ca4f65e2b64b978c0e9921abc7adebM.jpg", images[2])
+        self.assertIn("S0403274f8e314045aa63d01c8ef94db7B.jpg", images[3])
+
+    def test_collect_product_images_falls_back_to_dom_then_ld_json(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        dom_data = {
+            "images": [
+                "https://ae-pic-a1.aliexpress-media.com/kf/Sdom1.jpg",
+                "https://ae-pic-a1.aliexpress-media.com/kf/Sdom2.jpg",
+            ]
+        }
+        ld_product = {"image": ["https://ae-pic-a1.aliexpress-media.com/kf/Sld1.jpg"]}
+        images = mod.collect_product_images(None, ld_product, dom_data).split(";")
+        self.assertEqual(images, dom_data["images"])
+
+        images = mod.collect_product_images(None, ld_product, {}).split(";")
+        self.assertEqual(images, ["https://ae-pic-a1.aliexpress-media.com/kf/Sld1.jpg"])
+
     def test_build_url_query_us_only(self):
         import importlib.util
 
