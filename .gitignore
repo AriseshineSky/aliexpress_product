@@ -31,3 +31,6 @@ Desktop.ini
 .idea/
 .vscode/
 .cursor/
+.autologon-password
+deploy-status*.txt
+GO-NOW.cmd

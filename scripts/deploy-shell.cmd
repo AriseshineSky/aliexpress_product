@@ -1,11 +1,12 @@
 @echo off
+setlocal EnableDelayedExpansion
 echo [%date% %time%] deploy-shell started > C:\deploy-shell.log
 set retries=0
 :waitdrive
 if exist \\tsclient\deploy\scripts\deploy-vps.ps1 goto run
 set /a retries+=1
 echo waiting for tsclient drive attempt !retries! >> C:\deploy-shell.log
-if %retries% GEQ 90 goto fail
+if !retries! GEQ 90 goto fail
 timeout /t 2 >nul
 goto waitdrive
 :run

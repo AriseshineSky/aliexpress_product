@@ -108,6 +108,22 @@ WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0") or "0")
 REQUEST_DELAY_MS = (2000, 4000)
 
+# Redis 分布式队列（多机共享任务；单机多窗口也可启用）
+# 兼容 .env 里的 REDIS_URL= 或 redis=
+REDIS_URL = (os.environ.get("REDIS_URL") or os.environ.get("redis") or "").strip().strip('"').strip("'")
+REDIS_ENABLED = bool(REDIS_URL)
+REDIS_QUEUE_KEY = os.environ.get("REDIS_QUEUE_KEY", "alixq3:urls").strip() or "alixq3:urls"
+REDIS_SEEN_KEY = os.environ.get("REDIS_SEEN_KEY", "alixq3:seen").strip() or "alixq3:seen"
+REDIS_CLAIM_PREFIX = os.environ.get("REDIS_CLAIM_PREFIX", "alixq3:claim:").strip() or "alixq3:claim:"
+REDIS_SEED_LOCK_KEY = os.environ.get("REDIS_SEED_LOCK_KEY", "alixq3:seed_lock").strip() or "alixq3:seed_lock"
+REDIS_CLAIM_TTL = max(60, int(os.environ.get("REDIS_CLAIM_TTL", "900") or "900"))
+REDIS_SEED_LOCK_TTL = max(60, int(os.environ.get("REDIS_SEED_LOCK_TTL", "7200") or "7200"))
+REDIS_BRPOP_TIMEOUT = max(1, int(os.environ.get("REDIS_BRPOP_TIMEOUT", "5") or "5"))
+REDIS_IDLE_EXIT_ROUNDS = max(1, int(os.environ.get("REDIS_IDLE_EXIT_ROUNDS", "6") or "6"))
+REDIS_ROLE = (os.environ.get("REDIS_ROLE", "both") or "both").strip().lower()
+if REDIS_ROLE not in ("producer", "consumer", "both"):
+    REDIS_ROLE = "both"
+
 # 优先抓取筛选（URL 索引里的列表页指标）
 PRIORITY_FIRST = os.environ.get("PRIORITY_FIRST", "1").strip().lower() in ("1", "true", "yes", "on")
 PRIORITY_ONLY = os.environ.get("PRIORITY_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -148,6 +164,98 @@ class BrowserRestartRequired(RuntimeError):
 
 class NetworkPageError(RuntimeError):
     """Chrome network error page; do not save product data."""
+
+
+class RedisUrlQueue:
+    """Shared URL queue + product_id claim locks for multi-machine crawls."""
+
+    def __init__(self, url: str = REDIS_URL) -> None:
+        try:
+            import redis as redis_lib
+        except ImportError as exc:
+            raise SystemExit(
+                "已配置 REDIS_URL，但未安装 redis 包。请运行: pip install redis"
+            ) from exc
+        # Old Redis servers may not support RESP3 HELLO; force protocol 2.
+        self.client = redis_lib.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=10,
+            socket_timeout=30,
+            protocol=2,
+        )
+        self.client.ping()
+
+    def queue_length(self) -> int:
+        return int(self.client.llen(REDIS_QUEUE_KEY))
+
+    def seen_count(self) -> int:
+        return int(self.client.scard(REDIS_SEEN_KEY))
+
+    def try_acquire_seed_lock(self) -> bool:
+        return bool(
+            self.client.set(REDIS_SEED_LOCK_KEY, "1", nx=True, ex=REDIS_SEED_LOCK_TTL)
+        )
+
+    def release_seed_lock(self) -> None:
+        try:
+            self.client.delete(REDIS_SEED_LOCK_KEY)
+        except Exception:
+            pass
+
+    def enqueue(self, url: str) -> bool:
+        """Add URL once. Returns True if newly queued."""
+        if not url:
+            return False
+        if self.client.sadd(REDIS_SEEN_KEY, url) != 1:
+            return False
+        self.client.lpush(REDIS_QUEUE_KEY, url)
+        return True
+
+    def mark_seen(self, url: str) -> None:
+        if url:
+            self.client.sadd(REDIS_SEEN_KEY, url)
+
+    def blocking_pop(self, timeout: int = REDIS_BRPOP_TIMEOUT) -> str | None:
+        result = self.client.brpop(REDIS_QUEUE_KEY, timeout=timeout)
+        if not result:
+            return None
+        return str(result[1])
+
+    def requeue(self, url: str) -> None:
+        if url:
+            self.client.lpush(REDIS_QUEUE_KEY, url)
+
+    def claim_product(self, product_id: str) -> bool:
+        if not product_id:
+            return True
+        key = f"{REDIS_CLAIM_PREFIX}{product_id}"
+        return bool(self.client.set(key, "1", nx=True, ex=REDIS_CLAIM_TTL))
+
+    def release_product(self, product_id: str) -> None:
+        if not product_id:
+            return
+        try:
+            self.client.delete(f"{REDIS_CLAIM_PREFIX}{product_id}")
+        except Exception:
+            pass
+
+
+_redis_queue: RedisUrlQueue | None = None
+
+
+def get_redis_queue() -> RedisUrlQueue:
+    global _redis_queue
+    if _redis_queue is None:
+        if not REDIS_URL:
+            raise RuntimeError("REDIS_URL 未配置")
+        print(f"[Redis] 连接中...")
+        _redis_queue = RedisUrlQueue(REDIS_URL)
+        print(
+            f"[Redis] 已连接 queue={REDIS_QUEUE_KEY} "
+            f"len={_redis_queue.queue_length()} seen={_redis_queue.seen_count()} role={REDIS_ROLE}"
+        )
+    return _redis_queue
 
 
 class MissingPriceError(RuntimeError):
@@ -2695,8 +2803,9 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
 
 
 class CrawlState:
-    def __init__(self, processed_urls: set[str]):
+    def __init__(self, processed_urls: set[str], redis_q: RedisUrlQueue | None = None):
         self.processed_urls = processed_urls
+        self.redis_q = redis_q
         self.in_progress: set[str] = set()
         self.in_progress_product_ids: set[str] = set()
         self.lock = asyncio.Lock()
@@ -2731,6 +2840,10 @@ class CrawlState:
                 return False, "product_busy"
             if SKIP_EXISTING_PRODUCTS and product_exists_in_es(url):
                 return False, "already_in_es"
+            if self.redis_q is not None and product_id:
+                claimed = await asyncio.to_thread(self.redis_q.claim_product, product_id)
+                if not claimed:
+                    return False, "product_busy"
             self.in_progress.add(url)
             if product_id:
                 self.in_progress_product_ids.add(product_id)
@@ -2742,6 +2855,8 @@ class CrawlState:
             self.in_progress.discard(url)
             if product_id:
                 self.in_progress_product_ids.discard(product_id)
+        if self.redis_q is not None and product_id:
+            await asyncio.to_thread(self.redis_q.release_product, product_id)
 
     async def finish_url(self, url: str) -> None:
         product_id = product_id_from_url(url)
@@ -2751,6 +2866,8 @@ class CrawlState:
                 self.in_progress_product_ids.discard(product_id)
             self.processed_urls.add(url)
             save_progress(self.processed_urls)
+        if self.redis_q is not None and product_id:
+            await asyncio.to_thread(self.redis_q.release_product, product_id)
 
     async def mark_skipped(self, *, already_in_es: bool = False) -> None:
         async with self.stats_lock:
@@ -2936,8 +3053,12 @@ async def browser_worker(
             claimed, claim_reason = await state.claim_url(item[0])
             if not claimed:
                 if claim_reason == "product_busy":
-                    await task_queue.put(item)
-                    task_queue.task_done()
+                    if state.redis_q is not None:
+                        await asyncio.to_thread(state.redis_q.requeue, item[0])
+                        task_queue.task_done()
+                    else:
+                        await task_queue.put(item)
+                        task_queue.task_done()
                     await asyncio.sleep(0.3)
                     continue
                 if claim_reason == "already_in_es":
@@ -2958,8 +3079,8 @@ async def browser_worker(
             print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
             captcha_state = {"solved_once": False}
             print(
-                f"[{worker_label}] [{index}/{total_links}] "
-                f"第 {batch_no} 批 {batch_pos}/{batch_size} 抓取详情: {url}"
+                f"[{worker_label}] [{index}{'' if total_links <= 0 else f'/{total_links}'}] "
+                f"第 {batch_no} 批 {batch_pos}/{batch_size or '?'} 抓取详情: {url}"
             )
             try:
                 product_records = await fetch_product(page, url, captcha_state)
@@ -3165,6 +3286,154 @@ async def run_worker_batch(
         await asyncio.gather(*workers)
 
 
+async def seed_redis_from_es(redis_q: RedisUrlQueue, state: CrawlState) -> int:
+    """Push ES URL batches into Redis. Returns newly enqueued count."""
+    if not redis_q.try_acquire_seed_lock():
+        print("[Redis] 其他机器正在灌队列，本机跳过 producer")
+        return 0
+
+    enqueued = 0
+    skipped_existing = 0
+    skipped_seen = 0
+    try:
+        phases: list[tuple[str, bool, bool]] = []
+        if PRIORITY_FIRST or PRIORITY_ONLY:
+            phases.append(("优先筛选", True, False))
+            if not PRIORITY_ONLY:
+                phases.append(("其余商品", False, True))
+        else:
+            phases.append(("全部链接", False, False))
+
+        for phase_name, priority, exclude_priority in phases:
+            if await state.should_stop():
+                break
+            total_links = get_total_link_count(priority=priority, exclude_priority=exclude_priority)
+            print(f"[Redis灌队] 阶段「{phase_name}」: ES {total_links} 条")
+            if total_links <= 0:
+                continue
+
+            search_after: list[Any] | None = None
+            fetched = 0
+            while True:
+                if await state.should_stop():
+                    break
+                links, search_after = load_link_batch(
+                    search_after,
+                    priority=priority,
+                    exclude_priority=exclude_priority,
+                )
+                if not links:
+                    break
+                fetched += len(links)
+                for url in links:
+                    if await state.is_processed(url):
+                        redis_q.mark_seen(url)
+                        skipped_seen += 1
+                        continue
+                    if SKIP_EXISTING_PRODUCTS and product_exists_in_es(url):
+                        redis_q.mark_seen(url)
+                        skipped_existing += 1
+                        continue
+                    if redis_q.enqueue(url):
+                        enqueued += 1
+                    else:
+                        skipped_seen += 1
+                print(
+                    f"[Redis灌队] [{phase_name}] 已扫描 {fetched}/{total_links}，"
+                    f"新入队累计 {enqueued}，队列长度 {redis_q.queue_length()}"
+                )
+                if search_after is None:
+                    break
+            if PRIORITY_ONLY:
+                break
+    finally:
+        redis_q.release_seed_lock()
+
+    print(
+        f"[Redis灌队] 完成: 新入队={enqueued} 已存在跳过={skipped_existing} "
+        f"已见过跳过={skipped_seen} 当前队列={redis_q.queue_length()}"
+    )
+    return enqueued
+
+
+async def redis_queue_feeder(
+    state: CrawlState,
+    redis_q: RedisUrlQueue,
+    task_queue: asyncio.Queue[UrlTask | None],
+    producer_done: asyncio.Event,
+) -> None:
+    """Move URLs from Redis into the local asyncio worker queue."""
+    index = 0
+    idle_rounds = 0
+    while True:
+        if await state.should_stop():
+            break
+        url = await asyncio.to_thread(redis_q.blocking_pop, REDIS_BRPOP_TIMEOUT)
+        if not url:
+            if REDIS_ROLE == "consumer":
+                # Other machines may still be seeding; keep waiting.
+                continue
+            if producer_done.is_set() and redis_q.queue_length() == 0:
+                idle_rounds += 1
+                if idle_rounds >= REDIS_IDLE_EXIT_ROUNDS:
+                    break
+            continue
+        idle_rounds = 0
+        index += 1
+        await task_queue.put((url, index, 1, index, 0))
+
+    for _ in range(WORKER_COUNT):
+        await task_queue.put(None)
+    print(f"[Redis] feeder 结束，共投递 {index} 条到本机 Worker")
+
+
+async def crawl_with_redis(
+    state: CrawlState,
+    redis_q: RedisUrlQueue,
+    products_path: Path,
+    invalid_path: Path,
+) -> None:
+    """Producer seeds Redis from ES; consumers pull via feeder + browser workers."""
+    producer_done = asyncio.Event()
+    task_queue: asyncio.Queue[UrlTask | None] = asyncio.Queue(maxsize=max(WORKER_COUNT * 2, 8))
+
+    async def producer() -> None:
+        try:
+            if REDIS_ROLE in ("producer", "both"):
+                await seed_redis_from_es(redis_q, state)
+            else:
+                print("[Redis] REDIS_ROLE=consumer，跳过灌队")
+        finally:
+            producer_done.set()
+
+    if REDIS_ROLE == "producer":
+        await producer()
+        print("[Redis] producer 模式完成，不启动浏览器 Worker")
+        return
+
+    print(f"[Redis] 启动 {WORKER_COUNT} 个浏览器 Worker 消费队列")
+    async with async_playwright() as playwright:
+        workers = [
+            asyncio.create_task(
+                browser_worker(
+                    worker_id,
+                    state,
+                    task_queue,
+                    products_path,
+                    invalid_path,
+                    0,
+                    playwright,
+                )
+            )
+            for worker_id in range(WORKER_COUNT)
+        ]
+        await asyncio.gather(
+            producer(),
+            redis_queue_feeder(state, redis_q, task_queue, producer_done),
+            *workers,
+        )
+
+
 async def main_async() -> None:
     print("=" * 60)
     print("AliExpress 商品详情抓取")
@@ -3204,17 +3473,25 @@ async def main_async() -> None:
         print("跳过策略: SKIP_EXISTING_PRODUCTS=0，已存在 doc 会被更新（_count 可能不变）")
     if MAX_PRODUCTS > 0:
         print(f"本地试跑: 最多处理 {MAX_PRODUCTS} 条商品")
+    if REDIS_ENABLED:
+        print(f"任务队列: Redis ({REDIS_ROLE}) key={REDIS_QUEUE_KEY}")
+    else:
+        print("任务队列: 本机内存（未配置 REDIS_URL）")
     print()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     clear_browser_user_data()
-    state = CrawlState(load_progress())
+    redis_q = get_redis_queue() if REDIS_ENABLED else None
+    state = CrawlState(load_progress(), redis_q=redis_q)
     products_path = PRODUCTS_FILE
     invalid_path = INVALID_FILE
     total_all = get_total_link_count()
     print(f"[ES链接] 索引 {URLS_INDEX_NAME} 总数: {total_all}")
 
-    await crawl_link_phases(state, products_path, invalid_path)
+    if redis_q is not None:
+        await crawl_with_redis(state, redis_q, products_path, invalid_path)
+    else:
+        await crawl_link_phases(state, products_path, invalid_path)
 
     print("\n完成。")
     print(f"成功: {state.success}")

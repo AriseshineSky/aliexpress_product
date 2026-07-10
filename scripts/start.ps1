@@ -35,13 +35,13 @@ Write-Host "Python: $venvPython"
 Write-Host "Working dir: $Root"
 Write-Host ""
 
-$configCheck = & $venvPython -c "from alixq3 import WORKER_COUNT, HEADLESS, MAX_PRODUCTS; print(f'WORKER_COUNT={WORKER_COUNT} HEADLESS={HEADLESS} MAX_PRODUCTS={MAX_PRODUCTS}')" 2>&1
+$configCheck = & $venvPython -c "from alixq3 import WORKER_COUNT, HEADLESS, MAX_PRODUCTS, REDIS_ENABLED, REDIS_ROLE; print(f'WORKER_COUNT={WORKER_COUNT} HEADLESS={HEADLESS} MAX_PRODUCTS={MAX_PRODUCTS} REDIS={REDIS_ENABLED} ROLE={REDIS_ROLE}')" 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "Config check failed: $configCheck"
 } else {
     Write-Host "Config: $configCheck"
     if ($configCheck -match 'WORKER_COUNT=1\b') {
-        Write-Host "Tip: set WORKER_COUNT=2 in .env to open multiple browser windows."
+        Write-Host "Tip: set WORKER_COUNT=9 in .env to open multiple browser windows."
     }
 }
 Write-Host ""
