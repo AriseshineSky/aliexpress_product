@@ -120,6 +120,8 @@ REDIS_CLAIM_TTL = max(60, int(os.environ.get("REDIS_CLAIM_TTL", "900") or "900")
 REDIS_SEED_LOCK_TTL = max(60, int(os.environ.get("REDIS_SEED_LOCK_TTL", "7200") or "7200"))
 REDIS_BRPOP_TIMEOUT = max(1, int(os.environ.get("REDIS_BRPOP_TIMEOUT", "5") or "5"))
 REDIS_IDLE_EXIT_ROUNDS = max(1, int(os.environ.get("REDIS_IDLE_EXIT_ROUNDS", "6") or "6"))
+# Redis 模式下队列空时是否一直等待新任务（默认开启；设 0 则灌队结束后空闲退出）
+REDIS_WAIT_FOREVER = os.environ.get("REDIS_WAIT_FOREVER", "1").strip().lower() in ("1", "true", "yes", "on")
 REDIS_ROLE = (os.environ.get("REDIS_ROLE", "both") or "both").strip().lower()
 if REDIS_ROLE not in ("producer", "consumer", "both"):
     REDIS_ROLE = "both"
@@ -3362,19 +3364,31 @@ async def redis_queue_feeder(
     task_queue: asyncio.Queue[UrlTask | None],
     producer_done: asyncio.Event,
 ) -> None:
-    """Move URLs from Redis into the local asyncio worker queue."""
+    """Move URLs from Redis into the local asyncio worker queue.
+
+    By default (REDIS_WAIT_FOREVER=1) keeps waiting when the queue is empty so
+    start.bat does not exit after a batch is finished.
+    """
     index = 0
     idle_rounds = 0
+    wait_notice_every = max(12, 60 // max(REDIS_BRPOP_TIMEOUT, 1))  # ~60s
     while True:
         if await state.should_stop():
             break
         url = await asyncio.to_thread(redis_q.blocking_pop, REDIS_BRPOP_TIMEOUT)
         if not url:
-            if REDIS_ROLE == "consumer":
-                # Other machines may still be seeding; keep waiting.
+            idle_rounds += 1
+            if REDIS_WAIT_FOREVER or REDIS_ROLE == "consumer":
+                if idle_rounds == 1 or idle_rounds % wait_notice_every == 0:
+                    qlen = await asyncio.to_thread(redis_q.queue_length)
+                    print(
+                        f"[Redis] 队列空，继续等待新任务 "
+                        f"(queue={qlen}, waited≈{idle_rounds * REDIS_BRPOP_TIMEOUT}s, "
+                        f"本机已投递 {index})",
+                        flush=True,
+                    )
                 continue
             if producer_done.is_set() and redis_q.queue_length() == 0:
-                idle_rounds += 1
                 if idle_rounds >= REDIS_IDLE_EXIT_ROUNDS:
                     break
             continue
@@ -3405,13 +3419,16 @@ async def crawl_with_redis(
                 print("[Redis] REDIS_ROLE=consumer，跳过灌队")
         finally:
             producer_done.set()
+            if REDIS_WAIT_FOREVER:
+                print("[Redis] 灌队阶段结束；Worker 将继续等待队列中的新任务（Ctrl+C 退出）")
 
     if REDIS_ROLE == "producer":
         await producer()
         print("[Redis] producer 模式完成，不启动浏览器 Worker")
         return
 
-    print(f"[Redis] 启动 {WORKER_COUNT} 个浏览器 Worker 消费队列")
+    wait_mode = "一直等待新任务" if REDIS_WAIT_FOREVER else f"空闲约 {REDIS_IDLE_EXIT_ROUNDS * REDIS_BRPOP_TIMEOUT}s 后退出"
+    print(f"[Redis] 启动 {WORKER_COUNT} 个浏览器 Worker 消费队列（{wait_mode}）")
     async with async_playwright() as playwright:
         workers = [
             asyncio.create_task(
@@ -3474,7 +3491,8 @@ async def main_async() -> None:
     if MAX_PRODUCTS > 0:
         print(f"本地试跑: 最多处理 {MAX_PRODUCTS} 条商品")
     if REDIS_ENABLED:
-        print(f"任务队列: Redis ({REDIS_ROLE}) key={REDIS_QUEUE_KEY}")
+        wait = "一直等待" if REDIS_WAIT_FOREVER else "空闲退出"
+        print(f"任务队列: Redis ({REDIS_ROLE}) key={REDIS_QUEUE_KEY} ({wait})")
     else:
         print("任务队列: 本机内存（未配置 REDIS_URL）")
     print()
