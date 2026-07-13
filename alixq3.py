@@ -102,6 +102,13 @@ CAPTCHA_MANUAL_PAUSE_SECONDS = int(os.environ.get("CAPTCHA_MANUAL_PAUSE_SECONDS"
 MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("MAX_CAPTCHA_RESTARTS_PER_URL", "2") or "2")
 MAX_NETWORK_RESTARTS_PER_URL = int(os.environ.get("MAX_NETWORK_RESTARTS_PER_URL", "3") or "3")
 BROWSER_RESTART_DELAY_SECONDS = int(os.environ.get("BROWSER_RESTART_DELAY_SECONDS", "5") or "5")
+# 仅在确认无法获取商品信息（硬失败）时清空 persistent profile
+CLEAR_PROFILE_ON_HARD_FAIL = os.environ.get("CLEAR_PROFILE_ON_HARD_FAIL", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
 
 # 0 表示不限制；本地试跑可设 MAX_PRODUCTS=1
@@ -122,6 +129,10 @@ REDIS_BRPOP_TIMEOUT = max(1, int(os.environ.get("REDIS_BRPOP_TIMEOUT", "5") or "
 REDIS_IDLE_EXIT_ROUNDS = max(1, int(os.environ.get("REDIS_IDLE_EXIT_ROUNDS", "6") or "6"))
 # Redis 模式下队列空时是否一直等待新任务（默认开启；设 0 则灌队结束后空闲退出）
 REDIS_WAIT_FOREVER = os.environ.get("REDIS_WAIT_FOREVER", "1").strip().lower() in ("1", "true", "yes", "on")
+# 队列空闲后隔多久重新从 ES 灌入「产品索引尚无 doc」的 URL
+REDIS_RESEED_IDLE_SECONDS = max(
+    10, int(os.environ.get("REDIS_RESEED_IDLE_SECONDS", "60") or "60")
+)
 REDIS_ROLE = (os.environ.get("REDIS_ROLE", "both") or "both").strip().lower()
 if REDIS_ROLE not in ("producer", "consumer", "both"):
     REDIS_ROLE = "both"
@@ -214,6 +225,26 @@ class RedisUrlQueue:
         self.client.lpush(REDIS_QUEUE_KEY, url)
         return True
 
+    def force_enqueue(self, url: str) -> bool:
+        """Ensure URL is on the queue even if it was seen before.
+
+        Used for not-yet-crawled URLs that were marked seen after a pop/skip
+        but never landed in the products index. Dedupes existing list entries.
+        """
+        if not url:
+            return False
+        pipe = self.client.pipeline(transaction=True)
+        pipe.sadd(REDIS_SEEN_KEY, url)
+        pipe.lrem(REDIS_QUEUE_KEY, 0, url)
+        pipe.lpush(REDIS_QUEUE_KEY, url)
+        pipe.execute()
+        return True
+
+    def is_seen(self, url: str) -> bool:
+        if not url:
+            return False
+        return bool(self.client.sismember(REDIS_SEEN_KEY, url))
+
     def mark_seen(self, url: str) -> None:
         if url:
             self.client.sadd(REDIS_SEEN_KEY, url)
@@ -274,6 +305,16 @@ def is_browser_closed_error(exc: BaseException) -> bool:
         "target page, context or browser has been closed" in message
         or "browser has been closed" in message
         or "connection closed" in message
+    )
+
+
+def should_clear_profile_for_error(exc: BaseException | None) -> bool:
+    """Only wipe profile when we cannot obtain product info in this session."""
+    if not CLEAR_PROFILE_ON_HARD_FAIL or exc is None:
+        return False
+    return isinstance(
+        exc,
+        (BrowserRestartRequired, NetworkPageError, MissingPriceError, IncompleteFetchError),
     )
 
 
@@ -352,7 +393,11 @@ def webshare_proxy_label() -> str:
     if not proxy:
         return "未启用"
     username = proxy["username"]
-    rotate_note = "，每次重启浏览器会建立新连接并轮换 IP" if username.endswith("-rotate") else ""
+    rotate_note = (
+        "，硬失败清空 profile 并重启浏览器时会建立新连接并轮换 IP"
+        if username.endswith("-rotate")
+        else ""
+    )
     return f"Webshare {WEBSHARE_HOST}:{WEBSHARE_PORT} (user={username}){rotate_note}"
 
 
@@ -360,9 +405,15 @@ def captcha_restart_label() -> str:
     total = CAPTCHA_RECOVERY_ROUNDS * MAX_CAPTCHA_RESTARTS_PER_URL
     return (
         f"单轮 {CAPTCHA_RECOVERY_ROUNDS} 次验证码尝试，"
-        f"单商品最多重启浏览器 {MAX_CAPTCHA_RESTARTS_PER_URL} 次"
-        f"（合计最多 {total} 次）"
+        f"单商品最多硬重启浏览器 {MAX_CAPTCHA_RESTARTS_PER_URL} 次"
+        f"（合计最多 {total} 次；仅硬失败时清空 profile）"
     )
+
+
+def profile_policy_label() -> str:
+    if CLEAR_PROFILE_ON_HARD_FAIL:
+        return "会话复用 persistent profile；仅硬失败（验证码/网络/不完整）时清空"
+    return "会话复用 persistent profile；硬失败也不清空 profile"
 
 
 def build_chromium_args(worker_id: int = 0) -> list[str]:
@@ -382,31 +433,47 @@ def build_chromium_args(worker_id: int = 0) -> list[str]:
     return args
 
 
-async def launch_browser_context(playwright, worker_id: int = 0, retries: int = 3):
+async def launch_browser_context(
+    playwright,
+    worker_id: int = 0,
+    retries: int = 3,
+    *,
+    clear_profile: bool = False,
+):
+    """Launch a persistent Chromium context. Profile is wiped only when clear_profile=True."""
     last_error: Exception | None = None
+    user_data_dir = worker_user_data_dir(worker_id)
     for attempt in range(1, retries + 1):
-        clear_browser_user_data(worker_id)
+        wipe = clear_profile or attempt > 1
+        if wipe:
+            clear_browser_user_data(worker_id)
+            if attempt > 1:
+                print(f"浏览器启动失败后清空 profile 再试 ({attempt}/{retries})")
+        else:
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            cleanup_profile_locks(user_data_dir)
         try:
             proxy = build_webshare_proxy()
-            launch_kwargs: dict[str, Any] = {
+            context_kwargs: dict[str, Any] = {
                 "headless": HEADLESS,
                 "args": build_chromium_args(worker_id),
                 "ignore_default_args": ["--enable-automation"],
-            }
-            if proxy:
-                launch_kwargs["proxy"] = proxy
-            browser = await playwright.chromium.launch(**launch_kwargs)
-            context_kwargs: dict[str, Any] = {
                 "user_agent": USER_AGENT,
                 "locale": "en-US",
                 "viewport": None,
                 "no_viewport": True,
             }
+            if proxy:
+                context_kwargs["proxy"] = proxy
             if proxy and WEBSHARE_COUNTRY == "us":
                 context_kwargs["timezone_id"] = "America/New_York"
-            context = await browser.new_context(**context_kwargs)
+            context = await playwright.chromium.launch_persistent_context(
+                str(user_data_dir),
+                **context_kwargs,
+            )
             await context.add_init_script(STEALTH_SCRIPT)
-            page = await context.new_page()
+            page = context.pages[0] if context.pages else await context.new_page()
+            browser = context.browser
             return browser, context, page
         except Exception as exc:
             last_error = exc
@@ -626,6 +693,38 @@ def product_exists_in_es(url: str) -> bool:
         return resp.status_code == 200
     except Exception:
         return False
+
+
+def products_exist_in_es_batch(urls: list[str], *, chunk_size: int = 500) -> dict[str, bool]:
+    """Batch-check product docs via ES _mget. Missing/invalid URLs map to False."""
+    result = {u: False for u in urls}
+    docs: list[tuple[str, str]] = []
+    for url in urls:
+        product_id = product_id_from_url(url)
+        if not product_id:
+            continue
+        source = source_from_url(normalize_crawl_url(url))
+        docs.append((url, product_doc_id(source, product_id)))
+    if not docs:
+        return result
+
+    mget_url = f"http://{ES_HOST}:{ES_PORT}/{PRODUCT_INDEX_NAME}/_mget"
+    auth = (ES_USER, ES_PASSWORD)
+    for i in range(0, len(docs), chunk_size):
+        chunk = docs[i : i + chunk_size]
+        try:
+            resp = requests.post(
+                mget_url,
+                auth=auth,
+                json={"ids": [doc_id for _, doc_id in chunk]},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            for (url, _), doc in zip(chunk, resp.json().get("docs") or []):
+                result[url] = bool(doc.get("found"))
+        except Exception as exc:
+            print(f"[ES] _mget 批量检查失败，本批按不存在处理: {exc}")
+    return result
 
 
 def upload_product(product: dict[str, Any]) -> str:
@@ -2450,7 +2549,7 @@ async def handle_captcha(
             print("[验证码识别] 刷新后页面状态未完全确认，继续下一轮...")
 
     raise BrowserRestartRequired(
-        f"验证码处理 {CAPTCHA_RECOVERY_ROUNDS} 轮后仍未进入商品页，清空浏览器状态并重启"
+        f"验证码处理 {CAPTCHA_RECOVERY_ROUNDS} 轮后仍未进入商品页，需要硬重启浏览器"
     )
 
 async def extract_ld_json(page: Page) -> list[dict[str, Any]]:
@@ -3007,18 +3106,32 @@ async def close_browser_session(
     browser,
     context,
     worker_id: int,
+    *,
+    clear_profile: bool = False,
 ) -> None:
     if context:
         try:
             await asyncio.wait_for(context.close(), timeout=8)
         except Exception:
             pass
-    if browser:
+    elif browser:
         try:
             await asyncio.wait_for(browser.close(), timeout=8)
         except Exception:
             pass
-    clear_browser_user_data(worker_id)
+    if clear_profile:
+        clear_browser_user_data(worker_id)
+    else:
+        cleanup_profile_locks(worker_user_data_dir(worker_id))
+
+
+def _session_alive(context, page) -> bool:
+    if context is None or page is None:
+        return False
+    try:
+        return not page.is_closed()
+    except Exception:
+        return False
 
 
 async def browser_worker(
@@ -3034,194 +3147,215 @@ async def browser_worker(
     captcha_restart_counts: dict[str, int] = {}
     network_restart_counts: dict[str, int] = {}
     pending_task: UrlTask | None = None
+    browser = None
+    context = None
+    page = None
+    captcha_state: dict[str, bool] = {"solved_once": False}
     print(f"[{worker_label}] 启动")
 
-    while True:
-        if await state.should_stop():
-            break
-
-        # Claim a URL before opening the browser so idle workers do not sit on about:blank.
-        while pending_task is None:
-            if await state.should_stop():
-                print(f"[{worker_label}] 结束")
-                return
-
-            item = await task_queue.get()
-            if item is None:
-                task_queue.task_done()
-                print(f"[{worker_label}] 结束")
-                return
-
-            claimed, claim_reason = await state.claim_url(item[0])
-            if not claimed:
-                if claim_reason == "product_busy":
-                    if state.redis_q is not None:
-                        await asyncio.to_thread(state.redis_q.requeue, item[0])
-                        task_queue.task_done()
-                    else:
-                        await task_queue.put(item)
-                        task_queue.task_done()
-                    await asyncio.sleep(0.3)
-                    continue
-                if claim_reason == "already_in_es":
-                    await state.mark_skipped(already_in_es=True)
-                    task_queue.task_done()
-                    continue
-                await state.mark_skipped()
-                task_queue.task_done()
-                continue
-            pending_task = item
-
-        url, index, batch_no, batch_pos, batch_size = pending_task
+    async def shutdown_session(*, clear_profile: bool = False) -> None:
+        nonlocal browser, context, page, captcha_state
+        await close_browser_session(browser, context, worker_id, clear_profile=clear_profile)
         browser = None
         context = None
-        reset_after_product = False
-        try:
-            browser, context, page = await launch_browser_context(playwright, worker_id=worker_id)
-            print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
-            captcha_state = {"solved_once": False}
-            print(
-                f"[{worker_label}] [{index}{'' if total_links <= 0 else f'/{total_links}'}] "
-                f"第 {batch_no} 批 {batch_pos}/{batch_size or '?'} 抓取详情: {url}"
-            )
-            try:
-                product_records = await fetch_product(page, url, captcha_state)
-                if not product_records:
-                    raise BrowserRestartRequired("未获取到商品数据，不保存")
+        page = None
+        captcha_state = {"solved_once": False}
 
-                save_result = await state.save_product_records(products_path, invalid_path, url, product_records)
-                if save_result["primary_uploaded"]:
-                    await state.finish_url(url)
-                else:
+    async def ensure_browser() -> None:
+        nonlocal browser, context, page, captcha_state
+        if _session_alive(context, page):
+            return
+        if context is not None or browser is not None:
+            await shutdown_session(clear_profile=False)
+        browser, context, page = await launch_browser_context(
+            playwright,
+            worker_id=worker_id,
+            clear_profile=False,
+        )
+        captcha_state = {"solved_once": False}
+        print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
+
+    try:
+        while True:
+            if await state.should_stop():
+                break
+
+            # Claim a URL before opening the browser so idle workers do not sit on about:blank.
+            while pending_task is None:
+                if await state.should_stop():
+                    return
+
+                item = await task_queue.get()
+                if item is None:
+                    task_queue.task_done()
+                    return
+
+                claimed, claim_reason = await state.claim_url(item[0])
+                if not claimed:
+                    if claim_reason == "product_busy":
+                        if state.redis_q is not None:
+                            await asyncio.to_thread(state.redis_q.requeue, item[0])
+                            task_queue.task_done()
+                        else:
+                            await task_queue.put(item)
+                            task_queue.task_done()
+                        await asyncio.sleep(0.3)
+                        continue
+                    if claim_reason == "already_in_es":
+                        await state.mark_skipped(already_in_es=True)
+                        task_queue.task_done()
+                        continue
+                    await state.mark_skipped()
+                    task_queue.task_done()
+                    continue
+                pending_task = item
+
+            url, index, batch_no, batch_pos, batch_size = pending_task
+            try:
+                await ensure_browser()
+                assert page is not None
+                print(
+                    f"[{worker_label}] [{index}{'' if total_links <= 0 else f'/{total_links}'}] "
+                    f"第 {batch_no} 批 {batch_pos}/{batch_size or '?'} 抓取详情: {url}"
+                )
+                try:
+                    product_records = await fetch_product(page, url, captcha_state)
+                    if not product_records:
+                        raise BrowserRestartRequired("未获取到商品数据，不保存")
+
+                    save_result = await state.save_product_records(
+                        products_path, invalid_path, url, product_records
+                    )
+                    if save_result["primary_uploaded"]:
+                        await state.finish_url(url)
+                    else:
+                        await state.append_invalid(
+                            invalid_path,
+                            {
+                                "url": url,
+                                "product_id": product_id_from_url(url),
+                                "error": "页面已抓取但 ES 未写入（上传失败或记录无效），留待下次重试",
+                                "date": datetime.now().replace(microsecond=0).isoformat(),
+                            },
+                        )
+                        await state.release_url(url)
+                        print(f"  未写入 ES，URL 未标记为已处理，下次运行可重试: {url}")
+                    task_queue.task_done()
+                    pending_task = None
+                    await sleep()
+                except BrowserRestartRequired:
+                    raise
+                except NetworkPageError:
+                    raise
+                except MissingPriceError:
+                    raise
+                except IncompleteFetchError:
+                    raise
+                except Exception as exc:
+                    if is_browser_closed_error(exc):
+                        raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
                     await state.append_invalid(
                         invalid_path,
                         {
                             "url": url,
                             "product_id": product_id_from_url(url),
-                            "error": "页面已抓取但 ES 未写入（上传失败或记录无效），留待下次重试",
+                            "error": str(exc),
                             "date": datetime.now().replace(microsecond=0).isoformat(),
                         },
                     )
-                    await state.release_url(url)
-                    print(f"  未写入 ES，URL 未标记为已处理，下次运行可重试: {url}")
-                task_queue.task_done()
-                pending_task = None
-                reset_after_product = True
-                await sleep()
-            except BrowserRestartRequired:
-                raise
-            except NetworkPageError:
-                raise
-            except MissingPriceError:
-                raise
-            except IncompleteFetchError:
-                raise
-            except Exception as exc:
-                if is_browser_closed_error(exc):
-                    raise BrowserRestartRequired("浏览器已关闭，重新启动") from exc
-                await state.append_invalid(
-                    invalid_path,
-                    {
-                        "url": url,
-                        "product_id": product_id_from_url(url),
-                        "error": str(exc),
-                        "date": datetime.now().replace(microsecond=0).isoformat(),
-                    },
-                )
-                await state.mark_url_done(failed=True)
-                await state.finish_url(url)
-                task_queue.task_done()
-                pending_task = None
-                reset_after_product = True
-                print(f"  失败: {exc}")
-                await sleep()
-        except BrowserRestartRequired as exc:
-            if pending_task is None:
-                continue
+                    await state.mark_url_done(failed=True)
+                    await state.finish_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    print(f"  失败: {exc}")
+                    await sleep()
+            except BrowserRestartRequired as exc:
+                if pending_task is None:
+                    continue
 
-            url = pending_task[0]
-            captcha_restart_counts[url] = captcha_restart_counts.get(url, 0) + 1
-            retry_count = captcha_restart_counts[url]
-            print(
-                f"[{worker_label}] {exc}，当前商品浏览器重启 {retry_count}/"
-                f"{MAX_CAPTCHA_RESTARTS_PER_URL}。"
-            )
-            print(
-                f"[{worker_label}] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重新启动浏览器"
-                + (
+                url = pending_task[0]
+                captcha_restart_counts[url] = captcha_restart_counts.get(url, 0) + 1
+                retry_count = captcha_restart_counts[url]
+                print(
+                    f"[{worker_label}] {exc}，当前商品浏览器重启 {retry_count}/"
+                    f"{MAX_CAPTCHA_RESTARTS_PER_URL}。"
+                )
+                wipe = should_clear_profile_for_error(exc)
+                rotate_note = (
                     "（Webshare rotate 代理将分配新 IP）"
-                    if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
+                    if wipe and (WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate"))
                     else ""
                 )
-                + "。"
-            )
-            if retry_count >= MAX_CAPTCHA_RESTARTS_PER_URL:
-                await state.append_invalid(
-                    invalid_path,
-                    {
-                        "url": url,
-                        "product_id": product_id_from_url(url),
-                        "error": f"连续 {retry_count} 次遇到验证码，本批次跳过（下次运行可重试）",
-                        "date": datetime.now().replace(microsecond=0).isoformat(),
-                    },
-                )
-                await state.mark_url_done(failed=True)
-                await state.release_url(url)
-                task_queue.task_done()
-                pending_task = None
-                reset_after_product = True
-                print(f"[{worker_label}] 当前商品验证码重试已达上限，本批次跳过，留待下次运行重试。")
-        except (NetworkPageError, MissingPriceError, IncompleteFetchError) as exc:
-            if pending_task is None:
-                continue
-
-            url = pending_task[0]
-            network_restart_counts[url] = network_restart_counts.get(url, 0) + 1
-            retry_count = network_restart_counts[url]
-            print(
-                f"[{worker_label}] {exc}，当前商品重试 {retry_count}/"
-                f"{MAX_NETWORK_RESTARTS_PER_URL}。"
-            )
-            if retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
-                await state.release_url(url)
-                task_queue.task_done()
-                pending_task = None
-                reset_after_product = True
                 print(
-                    f"[{worker_label}] 本批次重试已达上限，未写入 ES，留待下次运行重试: {url}"
-                )
-            else:
-                print(
-                    f"[{worker_label}] 已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重试当前商品"
+                    f"[{worker_label}] "
                     + (
+                        f"已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后硬重启浏览器{rotate_note}。"
+                        if wipe
+                        else f"{BROWSER_RESTART_DELAY_SECONDS}s 后重启浏览器（保留 profile）。"
+                    )
+                )
+                await shutdown_session(clear_profile=wipe)
+                if retry_count >= MAX_CAPTCHA_RESTARTS_PER_URL:
+                    await state.append_invalid(
+                        invalid_path,
+                        {
+                            "url": url,
+                            "product_id": product_id_from_url(url),
+                            "error": f"连续 {retry_count} 次遇到验证码，本批次跳过（下次运行可重试）",
+                            "date": datetime.now().replace(microsecond=0).isoformat(),
+                        },
+                    )
+                    await state.mark_url_done(failed=True)
+                    await state.release_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    print(f"[{worker_label}] 当前商品验证码重试已达上限，本批次跳过，留待下次运行重试。")
+                else:
+                    print(f"[{worker_label}] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
+                    await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+            except (NetworkPageError, MissingPriceError, IncompleteFetchError) as exc:
+                if pending_task is None:
+                    continue
+
+                url = pending_task[0]
+                network_restart_counts[url] = network_restart_counts.get(url, 0) + 1
+                retry_count = network_restart_counts[url]
+                print(
+                    f"[{worker_label}] {exc}，当前商品重试 {retry_count}/"
+                    f"{MAX_NETWORK_RESTARTS_PER_URL}。"
+                )
+                wipe = should_clear_profile_for_error(exc)
+                if retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
+                    await shutdown_session(clear_profile=wipe)
+                    await state.release_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    print(
+                        f"[{worker_label}] 本批次重试已达上限，未写入 ES，留待下次运行重试: {url}"
+                    )
+                else:
+                    rotate_note = (
                         "（Webshare rotate 代理将分配新 IP）"
-                        if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
+                        if wipe and (WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate"))
                         else ""
                     )
-                    + "。"
-                )
-        finally:
-            await close_browser_session(browser, context, worker_id)
+                    print(
+                        f"[{worker_label}] "
+                        + (
+                            f"已清空浏览器 profile，{BROWSER_RESTART_DELAY_SECONDS}s 后重试当前商品{rotate_note}。"
+                            if wipe
+                            else f"{BROWSER_RESTART_DELAY_SECONDS}s 后重试当前商品（保留 profile）。"
+                        )
+                    )
+                    await shutdown_session(clear_profile=wipe)
+                    print(f"[{worker_label}] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
+                    await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
 
-        if await state.should_stop():
-            break
-
-        if pending_task is not None:
-            print(f"[{worker_label}] 等待 {BROWSER_RESTART_DELAY_SECONDS} 秒后重新启动浏览器。")
-            await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
-        elif reset_after_product:
-            rotate_note = (
-                "（Webshare rotate 代理将分配新 IP）"
-                if WEBSHARE_ROTATE or WEBSHARE_USER.endswith("-rotate")
-                else ""
-            )
-            print(
-                f"[{worker_label}] 当前商品已处理完毕，已重置浏览器，"
-                f"{BROWSER_RESTART_DELAY_SECONDS}s 后启动新会话{rotate_note}。"
-            )
-            await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
-
-    print(f"[{worker_label}] 结束")
+            if await state.should_stop():
+                break
+    finally:
+        await shutdown_session(clear_profile=False)
+        print(f"[{worker_label}] 结束")
 
 
 async def run_worker_batch(
@@ -3289,14 +3423,20 @@ async def run_worker_batch(
 
 
 async def seed_redis_from_es(redis_q: RedisUrlQueue, state: CrawlState) -> int:
-    """Push ES URL batches into Redis. Returns newly enqueued count."""
+    """Push ES URL batches into Redis. Returns newly enqueued count.
+
+    URLs that still need crawling (not in products index) are force-enqueued
+    even if they were previously marked seen — otherwise a drained queue can
+    stay empty forever while pending URLs remain.
+    """
     if not redis_q.try_acquire_seed_lock():
         print("[Redis] 其他机器正在灌队列，本机跳过 producer")
         return 0
 
     enqueued = 0
+    requeued = 0
     skipped_existing = 0
-    skipped_seen = 0
+    skipped_local = 0
     try:
         phases: list[tuple[str, bool, bool]] = []
         if PRIORITY_FIRST or PRIORITY_ONLY:
@@ -3327,22 +3467,29 @@ async def seed_redis_from_es(redis_q: RedisUrlQueue, state: CrawlState) -> int:
                 if not links:
                     break
                 fetched += len(links)
+                exists_map = (
+                    products_exist_in_es_batch(links) if SKIP_EXISTING_PRODUCTS else {u: False for u in links}
+                )
                 for url in links:
                     if await state.is_processed(url):
                         redis_q.mark_seen(url)
-                        skipped_seen += 1
+                        skipped_local += 1
                         continue
-                    if SKIP_EXISTING_PRODUCTS and product_exists_in_es(url):
+                    if SKIP_EXISTING_PRODUCTS and exists_map.get(url):
                         redis_q.mark_seen(url)
                         skipped_existing += 1
                         continue
-                    if redis_q.enqueue(url):
+                    already_seen = redis_q.is_seen(url)
+                    if already_seen:
+                        # Previously seen (popped/skipped) but still missing in products.
+                        redis_q.force_enqueue(url)
+                        requeued += 1
+                    elif redis_q.enqueue(url):
                         enqueued += 1
-                    else:
-                        skipped_seen += 1
                 print(
                     f"[Redis灌队] [{phase_name}] 已扫描 {fetched}/{total_links}，"
-                    f"新入队累计 {enqueued}，队列长度 {redis_q.queue_length()}"
+                    f"新入队累计 {enqueued}，seen 补入累计 {requeued}，"
+                    f"队列长度 {redis_q.queue_length()}"
                 )
                 if search_after is None:
                     break
@@ -3352,10 +3499,11 @@ async def seed_redis_from_es(redis_q: RedisUrlQueue, state: CrawlState) -> int:
         redis_q.release_seed_lock()
 
     print(
-        f"[Redis灌队] 完成: 新入队={enqueued} 已存在跳过={skipped_existing} "
-        f"已见过跳过={skipped_seen} 当前队列={redis_q.queue_length()}"
+        f"[Redis灌队] 完成: 新入队={enqueued} seen补入={requeued} "
+        f"已存在跳过={skipped_existing} 本机已处理跳过={skipped_local} "
+        f"当前队列={redis_q.queue_length()}"
     )
-    return enqueued
+    return enqueued + requeued
 
 
 async def redis_queue_feeder(
@@ -3413,14 +3561,40 @@ async def crawl_with_redis(
 
     async def producer() -> None:
         try:
-            if REDIS_ROLE in ("producer", "both"):
-                await seed_redis_from_es(redis_q, state)
-            else:
+            if REDIS_ROLE not in ("producer", "both"):
                 print("[Redis] REDIS_ROLE=consumer，跳过灌队")
+                return
+
+            while True:
+                added = await seed_redis_from_es(redis_q, state)
+                if not REDIS_WAIT_FOREVER:
+                    break
+                print(
+                    f"[Redis] 灌队阶段结束（本次入队 {added}）；"
+                    f"队列空闲 {REDIS_RESEED_IDLE_SECONDS}s 后将再次扫描未抓取 URL"
+                )
+                idle_seconds = 0
+                while idle_seconds < REDIS_RESEED_IDLE_SECONDS:
+                    if await state.should_stop():
+                        return
+                    qlen = await asyncio.to_thread(redis_q.queue_length)
+                    if qlen > 0:
+                        # Work remains; wait and re-check without reseeding yet.
+                        await asyncio.sleep(min(5, REDIS_RESEED_IDLE_SECONDS))
+                        idle_seconds = 0
+                        continue
+                    await asyncio.sleep(min(5, REDIS_RESEED_IDLE_SECONDS - idle_seconds))
+                    idle_seconds += 5
+                if await state.should_stop():
+                    return
+                qlen = await asyncio.to_thread(redis_q.queue_length)
+                if qlen > 0:
+                    continue
+                print("[Redis] 队列仍空，重新从 ES 灌入尚未入库的 URL…")
         finally:
             producer_done.set()
-            if REDIS_WAIT_FOREVER:
-                print("[Redis] 灌队阶段结束；Worker 将继续等待队列中的新任务（Ctrl+C 退出）")
+            if REDIS_WAIT_FOREVER and REDIS_ROLE in ("producer", "both"):
+                print("[Redis] producer 已停止；Worker 若仍在运行可继续消费残留队列")
 
     if REDIS_ROLE == "producer":
         await producer()
@@ -3472,11 +3646,12 @@ async def main_async() -> None:
     if WORKER_COUNT > 1:
         print(f"浏览器 profile 目录: {USER_DATA_DIR}/worker_0 .. worker_{WORKER_COUNT - 1}")
     else:
-        print("浏览器模式: 无痕模式，不保存用户目录")
+        print(f"浏览器 profile 目录: {USER_DATA_DIR}")
+    print(f"浏览器策略: {profile_policy_label()}")
     print(f"浏览器代理: {webshare_proxy_label()}")
     print(f"xAI 验证码: {xai_config_label()}")
     print(f"验证码重试: {captcha_restart_label()}")
-    print(f"浏览器重启等待: {BROWSER_RESTART_DELAY_SECONDS}s（重启前会清空 profile）")
+    print(f"浏览器硬重启等待: {BROWSER_RESTART_DELAY_SECONDS}s")
     if PRIORITY_FIRST or PRIORITY_ONLY:
         mode = "仅优先筛选" if PRIORITY_ONLY else "优先筛选后再抓其余"
         print(f"抓取策略: {mode}")
@@ -3498,7 +3673,16 @@ async def main_async() -> None:
     print()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    clear_browser_user_data()
+    # Keep persistent profiles across runs; only clear stale Chromium lock files.
+    if WORKER_COUNT <= 1:
+        USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        cleanup_profile_locks(USER_DATA_DIR)
+    else:
+        USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        for wid in range(WORKER_COUNT):
+            profile_dir = worker_user_data_dir(wid)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            cleanup_profile_locks(profile_dir)
     redis_q = get_redis_queue() if REDIS_ENABLED else None
     state = CrawlState(load_progress(), redis_q=redis_q)
     products_path = PRODUCTS_FILE

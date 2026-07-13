@@ -76,6 +76,8 @@ start.bat
 
 输出目录：`产品详情/`（本地 jsonl + 进度文件）
 
+浏览器使用 persistent profile（`browser_playwright/`），同一 Worker 会复用会话连续抓多个商品；**只有确认无法获取商品信息**（验证码/网络错误/字段不完整等硬失败）时才会清空 profile 并硬重启。本地试跑可在 `.env` 设 `MAX_PRODUCTS=1`、`WORKER_COUNT=1`、`HEADLESS=0`。
+
 ### 6. 更新代码
 
 ```powershell

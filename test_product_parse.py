@@ -464,6 +464,29 @@ class ProductParseTestCase(unittest.TestCase):
         )
         self.assertTrue(mod.is_us_product_url("https://www.aliexpress.us/item/1.html"))
 
+    def test_should_clear_profile_for_error(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        original = mod.CLEAR_PROFILE_ON_HARD_FAIL
+        try:
+            mod.CLEAR_PROFILE_ON_HARD_FAIL = True
+            self.assertFalse(mod.should_clear_profile_for_error(None))
+            self.assertFalse(mod.should_clear_profile_for_error(ValueError("generic")))
+            self.assertTrue(mod.should_clear_profile_for_error(mod.BrowserRestartRequired("captcha")))
+            self.assertTrue(mod.should_clear_profile_for_error(mod.NetworkPageError("net")))
+            self.assertTrue(mod.should_clear_profile_for_error(mod.MissingPriceError("price")))
+            self.assertTrue(mod.should_clear_profile_for_error(mod.IncompleteFetchError("incomplete")))
+
+            mod.CLEAR_PROFILE_ON_HARD_FAIL = False
+            self.assertFalse(mod.should_clear_profile_for_error(mod.BrowserRestartRequired("captcha")))
+            self.assertFalse(mod.should_clear_profile_for_error(mod.NetworkPageError("net")))
+        finally:
+            mod.CLEAR_PROFILE_ON_HARD_FAIL = original
+
 
 if __name__ == "__main__":
     unittest.main()
