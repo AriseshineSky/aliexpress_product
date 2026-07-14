@@ -28,9 +28,29 @@ fi
 
 export PYTHONUNBUFFERED=1
 
-echo "==> Starting alixq3.py"
+# Read PROXY_MODE from .env without sourcing the whole file (passwords may have special chars).
+PROXY_MODE="$(
+  "$VENV_PYTHON" - <<'PY'
+from pathlib import Path
+try:
+    from dotenv import dotenv_values
+    vals = dotenv_values(Path(".env"))
+except Exception:
+    vals = {}
+mode = (vals.get("PROXY_MODE") or "rotate").strip().lower()
+print(mode)
+PY
+)"
+
+echo "==> PROXY_MODE=${PROXY_MODE}"
 echo "Python: $VENV_PYTHON"
 echo "Working dir: $ROOT"
 echo
 
+if [[ "$PROXY_MODE" == "pool" ]]; then
+  echo "==> Starting scripts/run_fixed_pool.py (homepage warmup + proxy pool)"
+  exec "$VENV_PYTHON" scripts/run_fixed_pool.py
+fi
+
+echo "==> Starting alixq3.py"
 exec "$VENV_PYTHON" alixq3.py

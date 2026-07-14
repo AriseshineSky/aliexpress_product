@@ -157,10 +157,10 @@ PROXY_FILE = Path(
     or str(_DEFAULT_PROXY_FILE)
 )
 PROXY_INDEX = max(0, int(os.environ.get("PROXY_INDEX", "0") or "0"))
-# static 模式下启动后先逛首页/分类/商品页做 cookies 预热
+# static/pool：启动后先逛首页/分类/商品页做 cookies 预热
 SESSION_WARMUP = os.environ.get(
     "SESSION_WARMUP",
-    "1" if PROXY_MODE == "static" else "0",
+    "1" if PROXY_MODE in ("static", "pool") else "0",
 ).strip().lower() in ("1", "true", "yes", "on")
 # 验证码 LLM 尝试失败后：是否保留浏览器 session/cookies/代理，跳过当前 URL 继续下一个
 # pool 模式默认关闭：验证码失败视为代理被屏蔽，需换 IP+指纹

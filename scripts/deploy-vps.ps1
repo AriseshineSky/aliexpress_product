@@ -227,9 +227,14 @@ try {
     Write-Log "Updated .env: WORKER_COUNT=$WorkerCount HEADLESS=0 MAX_PRODUCTS=0 REDIS_ROLE=$RedisRole"
 
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and ($_.CommandLine -match 'alixq3\.py') } |
+        Where-Object {
+            $_.CommandLine -and (
+                $_.CommandLine -match 'alixq3\.py' -or
+                $_.CommandLine -match 'run_fixed_pool\.py'
+            )
+        } |
         ForEach-Object {
-            Write-Log "Stopping previous alixq3.py PID=$($_.ProcessId)"
+            Write-Log "Stopping previous crawler PID=$($_.ProcessId)"
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
 
