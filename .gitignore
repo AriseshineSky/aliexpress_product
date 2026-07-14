@@ -18,6 +18,9 @@ img/
 *.jsonl
 *.log
 
+# Proxy credential lists
+data/
+
 # Playwright
 .ms-playwright/
 .playwright-mcp/

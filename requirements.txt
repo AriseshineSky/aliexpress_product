@@ -1,4 +1,6 @@
 playwright
+playwright-stealth
+pw-stealth-enhanced
 pillow
 requests
 python-dotenv

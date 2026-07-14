@@ -78,6 +78,23 @@ start.bat
 
 浏览器使用 persistent profile（`browser_playwright/`），同一 Worker 会复用会话连续抓多个商品；**只有确认无法获取商品信息**（验证码/网络错误/字段不完整等硬失败）时才会清空 profile 并硬重启。本地试跑可在 `.env` 设 `MAX_PRODUCTS=1`、`WORKER_COUNT=1`、`HEADLESS=0`。
 
+### 代理模式
+
+| `PROXY_MODE` | 说明 |
+|--------------|------|
+| `rotate`（默认） | 现有 Webshare 网关 + rotate，硬失败可换 IP |
+| `static` | 使用 `data/*.txt` 固定代理（`host:port:user:pass`），同一会话保持 IP/cookies |
+
+`static` 模式会先预热首页→分类→商品页，验证码 LLM 失败后**保留 session**并换下一 URL；连续失败达到 `PROXY_MAX_CONSECUTIVE_CAPTCHA` 后停止该 Worker。
+
+反检测（默认开启）：`playwright-stealth` + 与代理绑定的 Canvas/WebGL 指纹池（`data/fingerprints.json`）+ 贝塞尔鼠标轨迹。可用 `STEALTH_ENABLED` / `FINGERPRINT_ENABLED` / `HUMAN_MOUSE_ENABLED` 开关。
+
+单代理容量测试：
+
+```bash
+.venv/bin/python scripts/test_one_proxy.py --proxy-index 0
+```
+
 ### 6. 更新代码
 
 ```powershell

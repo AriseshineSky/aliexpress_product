@@ -464,6 +464,55 @@ class ProductParseTestCase(unittest.TestCase):
         )
         self.assertTrue(mod.is_us_product_url("https://www.aliexpress.us/item/1.html"))
 
+    def test_fingerprint_bound_to_proxy_key(self):
+        from stealth_fp import build_fingerprint, load_or_create_fingerprint
+        import tempfile
+        from pathlib import Path
+        import stealth_fp
+
+        a = build_fingerprint("proxy:1.2.3.4:8080")
+        b = build_fingerprint("proxy:1.2.3.4:8080")
+        c = build_fingerprint("proxy:9.9.9.9:8080")
+        self.assertEqual(a.user_agent, b.user_agent)
+        self.assertEqual(a.webgl_renderer, b.webgl_renderer)
+        self.assertEqual(a.seed, b.seed)
+        self.assertNotEqual(a.seed, c.seed)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = stealth_fp.FINGERPRINT_STORE
+            try:
+                stealth_fp.FINGERPRINT_STORE = Path(tmp) / "fps.json"
+                fp1 = load_or_create_fingerprint("proxy:10.0.0.1:1")
+                fp2 = load_or_create_fingerprint("proxy:10.0.0.1:1")
+                self.assertEqual(fp1.seed, fp2.seed)
+                self.assertTrue(stealth_fp.FINGERPRINT_STORE.exists())
+            finally:
+                stealth_fp.FINGERPRINT_STORE = original
+
+    def test_load_static_proxies_and_labels(self):
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        spec = importlib.util.spec_from_file_location("alixq3", "alixq3.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "proxies.txt"
+            path.write_text(
+                "1.2.3.4:8080:user1:pass1\n"
+                "# comment\n"
+                "5.6.7.8:9000:user2:pass:with:colons\n",
+                encoding="utf-8",
+            )
+            proxies = mod.load_static_proxies(path)
+            self.assertEqual(len(proxies), 2)
+            self.assertEqual(proxies[0].host, "1.2.3.4")
+            self.assertEqual(proxies[0].to_playwright()["server"], "http://1.2.3.4:8080")
+            self.assertEqual(proxies[1].password, "pass:with:colons")
+            self.assertIn("#0", proxies[0].label())
+
     def test_should_clear_profile_for_error(self):
         import importlib.util
 

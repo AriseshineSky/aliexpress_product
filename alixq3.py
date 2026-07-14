@@ -24,6 +24,17 @@ from pydantic import ValidationError
 
 from em_product.product import StandardProduct
 from html_utils import clean_product_description
+from stealth_fp import (
+    FINGERPRINT_ENABLED,
+    HUMAN_MOUSE_ENABLED,
+    STEALTH_ENABLED,
+    apply_stealth_and_fingerprint,
+    fingerprint_key_for_worker,
+    human_click_locator,
+    human_idle,
+    human_scroll,
+    load_or_create_fingerprint,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -94,6 +105,32 @@ WEBSHARE_HOST = os.environ.get("WEBSHARE_HOST", "p.webshare.io").strip()
 WEBSHARE_PORT = os.environ.get("WEBSHARE_PORT", "80").strip()
 WEBSHARE_ROTATE = os.environ.get("WEBSHARE_ROTATE", "1").strip().lower() in ("1", "true", "yes", "on")
 
+# 代理模式：
+#   rotate — 现有 Webshare 网关 + rotate（硬失败可换 IP）
+#   static — 使用 data/ 里固定住宅代理列表（同一会话保持同一 IP / cookies）
+PROXY_MODE = (os.environ.get("PROXY_MODE", "rotate") or "rotate").strip().lower()
+if PROXY_MODE not in ("rotate", "static"):
+    PROXY_MODE = "rotate"
+_DEFAULT_PROXY_FILE = BASE_DIR / "data" / "Webshare 1000 proxies.txt"
+PROXY_FILE = Path(
+    os.environ.get("PROXY_FILE", str(_DEFAULT_PROXY_FILE)).strip() or str(_DEFAULT_PROXY_FILE)
+)
+PROXY_INDEX = max(0, int(os.environ.get("PROXY_INDEX", "0") or "0"))
+# static 模式下启动后先逛首页/分类/商品页做 cookies 预热
+SESSION_WARMUP = os.environ.get(
+    "SESSION_WARMUP",
+    "1" if PROXY_MODE == "static" else "0",
+).strip().lower() in ("1", "true", "yes", "on")
+# 验证码 LLM 尝试失败后：是否保留浏览器 session/cookies/代理，跳过当前 URL 继续下一个
+CAPTCHA_KEEP_SESSION = os.environ.get(
+    "CAPTCHA_KEEP_SESSION",
+    "1" if PROXY_MODE == "static" else "0",
+).strip().lower() in ("1", "true", "yes", "on")
+# static 模式下连续验证码未能通过多少次后认为代理“烧掉”，停止该 Worker
+PROXY_MAX_CONSECUTIVE_CAPTCHA = max(
+    1, int(os.environ.get("PROXY_MAX_CONSECUTIVE_CAPTCHA", "3") or "3")
+)
+
 HEADLESS = os.environ.get("HEADLESS", "0").strip().lower() in ("1", "true", "yes", "on")
 CAPTCHA_WAIT_SECONDS = 120
 CAPTCHA_MAX_ROUNDS = 30
@@ -156,7 +193,18 @@ USER_AGENT = (
 )
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-window.chrome = window.chrome || { runtime: {} };
+window.chrome = window.chrome || { runtime: {}, app: { isInstalled: false }, csi: () => {}, loadTimes: () => {} };
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+  window.navigator.permissions.query = (parameters) => (
+    parameters && parameters.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : originalQuery(parameters)
+  );
+}
 """
 CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -170,13 +218,105 @@ PROFILE_LOCK_FILES = (
     "lockfile",
 )
 
+ALIEXPRESS_HOME_URL = "https://www.aliexpress.us/"
+
 
 class BrowserRestartRequired(RuntimeError):
     pass
 
 
+class CaptchaKeepSessionError(RuntimeError):
+    """Captcha unresolved after LLM attempts; keep proxy/session and try next URL."""
+
+
 class NetworkPageError(RuntimeError):
     """Chrome network error page; do not save product data."""
+
+
+class StaticProxy:
+    """Single endpoint from Webshare-style host:port:user:pass lines."""
+
+    __slots__ = ("host", "port", "username", "password", "index")
+
+    def __init__(
+        self,
+        host: str,
+        port: str,
+        username: str,
+        password: str,
+        index: int = 0,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.index = index
+
+    def to_playwright(self) -> dict[str, str]:
+        return {
+            "server": f"http://{self.host}:{self.port}",
+            "username": self.username,
+            "password": self.password,
+        }
+
+    def label(self) -> str:
+        return f"#{self.index} {self.host}:{self.port}"
+
+
+_static_proxies_cache: list[StaticProxy] | None = None
+_worker_static_proxies: dict[int, StaticProxy] = {}
+
+
+def load_static_proxies(path: Path | None = None) -> list[StaticProxy]:
+    """Load proxies from ``host:port:user:pass`` text file (one per line)."""
+    global _static_proxies_cache
+    proxy_path = path or PROXY_FILE
+    if _static_proxies_cache is not None and path is None:
+        return _static_proxies_cache
+
+    if not proxy_path.exists():
+        raise FileNotFoundError(f"代理文件不存在: {proxy_path}")
+
+    proxies: list[StaticProxy] = []
+    for line_no, raw in enumerate(
+        proxy_path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+    ):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) < 4:
+            print(f"[代理] 跳过格式异常行 {line_no}: {line[:40]}")
+            continue
+        host, port, username, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
+        if not host or not port:
+            continue
+        proxies.append(
+            StaticProxy(
+                host=host.strip(),
+                port=port.strip(),
+                username=username.strip(),
+                password=password.strip(),
+                index=len(proxies),
+            )
+        )
+
+    if not proxies:
+        raise RuntimeError(f"代理文件为空或格式无效: {proxy_path}")
+    if path is None:
+        _static_proxies_cache = proxies
+    return proxies
+
+
+def get_static_proxy_for_worker(worker_id: int = 0) -> StaticProxy:
+    """Assign a fixed proxy to a worker (PROXY_INDEX + worker_id)."""
+    if worker_id in _worker_static_proxies:
+        return _worker_static_proxies[worker_id]
+    proxies = load_static_proxies()
+    idx = (PROXY_INDEX + worker_id) % len(proxies)
+    proxy = proxies[idx]
+    _worker_static_proxies[worker_id] = proxy
+    return proxy
 
 
 class RedisUrlQueue:
@@ -388,6 +528,13 @@ def build_webshare_proxy() -> dict[str, str] | None:
     }
 
 
+def build_browser_proxy(worker_id: int = 0) -> dict[str, str] | None:
+    """按 PROXY_MODE 选择 rotate(Webshare) 或 static(本地代理列表)。"""
+    if PROXY_MODE == "static":
+        return get_static_proxy_for_worker(worker_id).to_playwright()
+    return build_webshare_proxy()
+
+
 def webshare_proxy_label() -> str:
     proxy = build_webshare_proxy()
     if not proxy:
@@ -399,6 +546,27 @@ def webshare_proxy_label() -> str:
         else ""
     )
     return f"Webshare {WEBSHARE_HOST}:{WEBSHARE_PORT} (user={username}){rotate_note}"
+
+
+def browser_proxy_label(worker_id: int = 0) -> str:
+    if PROXY_MODE == "static":
+        try:
+            proxy = get_static_proxy_for_worker(worker_id)
+        except Exception as exc:
+            return f"static 模式错误: {exc}"
+        return f"static {proxy.label()} (file={PROXY_FILE.name})"
+    return webshare_proxy_label()
+
+
+def proxy_mode_label() -> str:
+    if PROXY_MODE == "static":
+        return (
+            f"static 固定代理 | file={PROXY_FILE} | index={PROXY_INDEX} | "
+            f"warmup={'on' if SESSION_WARMUP else 'off'} | "
+            f"captcha_keep_session={'on' if CAPTCHA_KEEP_SESSION else 'off'} | "
+            f"burn_after={PROXY_MAX_CONSECUTIVE_CAPTCHA} 次连续验证码失败"
+        )
+    return "rotate (Webshare 网关)"
 
 
 def captcha_restart_label() -> str:
@@ -416,9 +584,29 @@ def profile_policy_label() -> str:
     return "会话复用 persistent profile；硬失败也不清空 profile"
 
 
-def build_chromium_args(worker_id: int = 0) -> list[str]:
+def resolve_fingerprint_for_worker(worker_id: int = 0):
+    """Bind fingerprint to static proxy identity (or worker id for rotate mode)."""
+    if not FINGERPRINT_ENABLED:
+        return None
+    proxy_label: str | None = None
+    if PROXY_MODE == "static":
+        try:
+            proxy = get_static_proxy_for_worker(worker_id)
+            proxy_label = f"{proxy.host}:{proxy.port}"
+        except Exception:
+            proxy_label = None
+    key = fingerprint_key_for_worker(worker_id, proxy_label)
+    timezone_id = "America/New_York" if (PROXY_MODE == "static" or WEBSHARE_COUNTRY == "us") else "UTC"
+    return load_or_create_fingerprint(key, timezone_id=timezone_id)
+
+
+def build_chromium_args(worker_id: int = 0, *, viewport: tuple[int, int] | None = None) -> list[str]:
     args = list(CHROMIUM_ARGS)
-    if WORKER_COUNT > 1:
+    # Prefer window size matching fingerprint over --start-maximized (more consistent FP).
+    if viewport is not None:
+        args = [arg for arg in args if arg != "--start-maximized"]
+        args.append(f"--window-size={viewport[0]},{viewport[1]}")
+    elif WORKER_COUNT > 1:
         args = [arg for arg in args if arg != "--start-maximized"]
     if not HEADLESS and WORKER_COUNT > 1:
         cols = min(WORKER_COUNT, 3)
@@ -427,9 +615,10 @@ def build_chromium_args(worker_id: int = 0) -> list[str]:
         args.extend(
             [
                 f"--window-position={col * 680},{row * 420}",
-                "--window-size=640,400",
             ]
         )
+        if viewport is None:
+            args.append("--window-size=640,400")
     return args
 
 
@@ -443,6 +632,7 @@ async def launch_browser_context(
     """Launch a persistent Chromium context. Profile is wiped only when clear_profile=True."""
     last_error: Exception | None = None
     user_data_dir = worker_user_data_dir(worker_id)
+    fingerprint = resolve_fingerprint_for_worker(worker_id)
     for attempt in range(1, retries + 1):
         wipe = clear_profile or attempt > 1
         if wipe:
@@ -453,26 +643,52 @@ async def launch_browser_context(
             user_data_dir.mkdir(parents=True, exist_ok=True)
             cleanup_profile_locks(user_data_dir)
         try:
-            proxy = build_webshare_proxy()
+            proxy = build_browser_proxy(worker_id)
+            use_fp_viewport = fingerprint is not None and FINGERPRINT_ENABLED
             context_kwargs: dict[str, Any] = {
                 "headless": HEADLESS,
-                "args": build_chromium_args(worker_id),
+                "args": build_chromium_args(
+                    worker_id,
+                    viewport=(
+                        (fingerprint.viewport_width, fingerprint.viewport_height)
+                        if use_fp_viewport
+                        else None
+                    ),
+                ),
                 "ignore_default_args": ["--enable-automation"],
-                "user_agent": USER_AGENT,
-                "locale": "en-US",
-                "viewport": None,
-                "no_viewport": True,
+                "user_agent": fingerprint.user_agent if fingerprint else USER_AGENT,
+                "locale": fingerprint.locale if fingerprint else "en-US",
             }
+            if use_fp_viewport:
+                context_kwargs["viewport"] = {
+                    "width": fingerprint.viewport_width,
+                    "height": fingerprint.viewport_height,
+                }
+            else:
+                context_kwargs["viewport"] = None
+                context_kwargs["no_viewport"] = True
             if proxy:
                 context_kwargs["proxy"] = proxy
-            if proxy and WEBSHARE_COUNTRY == "us":
-                context_kwargs["timezone_id"] = "America/New_York"
+            tz = (
+                fingerprint.timezone_id
+                if fingerprint
+                else ("America/New_York" if (PROXY_MODE == "static" or WEBSHARE_COUNTRY == "us") else None)
+            )
+            if proxy and tz:
+                context_kwargs["timezone_id"] = tz
             context = await playwright.chromium.launch_persistent_context(
                 str(user_data_dir),
                 **context_kwargs,
             )
-            await context.add_init_script(STEALTH_SCRIPT)
             page = context.pages[0] if context.pages else await context.new_page()
+            stealth_label = await apply_stealth_and_fingerprint(context, page, fingerprint)
+            # Keep legacy init script as last-resort baseline when packages disabled.
+            if not STEALTH_ENABLED:
+                await context.add_init_script(STEALTH_SCRIPT)
+            if fingerprint:
+                print(f"[指纹] {fingerprint.label()} | stealth={stealth_label}")
+            else:
+                print(f"[指纹] 未启用 | stealth={stealth_label}")
             browser = context.browser
             return browser, context, page
         except Exception as exc:
@@ -2548,9 +2764,149 @@ async def handle_captcha(
         else:
             print("[验证码识别] 刷新后页面状态未完全确认，继续下一轮...")
 
-    raise BrowserRestartRequired(
-        f"验证码处理 {CAPTCHA_RECOVERY_ROUNDS} 轮后仍未进入商品页，需要硬重启浏览器"
+    raise (
+        CaptchaKeepSessionError(
+            f"验证码处理 {CAPTCHA_RECOVERY_ROUNDS} 轮后仍未进入商品页；"
+            "保持 session/cookies/代理，跳过当前 URL"
+        )
+        if CAPTCHA_KEEP_SESSION
+        else BrowserRestartRequired(
+            f"验证码处理 {CAPTCHA_RECOVERY_ROUNDS} 轮后仍未进入商品页，需要硬重启浏览器"
+        )
     )
+
+
+async def _dismiss_aliexpress_popups(page: Page, *, worker_id: int = 0) -> None:
+    selectors = (
+        "button:has-text('Accept')",
+        "button:has-text('Got it')",
+        "button:has-text('OK')",
+        "[class*='close--']",
+        "[aria-label='Close']",
+        ".pop-close-btn",
+    )
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() > 0 and await loc.is_visible():
+                if HUMAN_MOUSE_ENABLED:
+                    await human_click_locator(page, loc, worker_id=worker_id, timeout=1500)
+                else:
+                    await loc.click(timeout=1500)
+                await asyncio.sleep(0.4)
+        except Exception:
+            continue
+
+
+async def warmup_aliexpress_session(
+    page: Page,
+    captcha_state: dict[str, bool],
+    *,
+    worker_id: int = 0,
+) -> None:
+    """Browse homepage → category → product to warm cookies/session under a fixed proxy."""
+    print("[预热] 打开 AliExpress 首页…")
+    try:
+        await page.goto(ALIEXPRESS_HOME_URL, wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(2500)
+        await _dismiss_aliexpress_popups(page, worker_id=worker_id)
+        if await is_captcha_page_visible(page):
+            print("[预热] 首页出现验证码，尝试 LLM 通过…")
+            await handle_captcha(page, captcha_state, product_url=ALIEXPRESS_HOME_URL)
+        await human_scroll(page, 1200, worker_id=worker_id)
+        await human_idle(page, worker_id=worker_id, seconds=random.uniform(0.8, 1.6))
+    except CaptchaKeepSessionError:
+        print("[预热] 首页验证码未能通过，仍继续后续预热步骤（保留 session）")
+    except Exception as exc:
+        print(f"[预热] 首页访问异常: {exc}")
+
+    # Category / channel links (never confuse with product /item/ pages)
+    category_href: str | None = None
+    try:
+        category_href = await page.evaluate(
+            """() => {
+              const links = Array.from(document.querySelectorAll('a[href]'));
+              const isCategory = (href) =>
+                /aliexpress\\.us\\/(category\\/|c\\/|w\\/wholesale-|ssr\\/category)/i.test(href)
+                && !/\\/item\\//i.test(href);
+              const preferred = links.find((a) => isCategory(a.href || ''));
+              if (preferred) return preferred.href;
+              const any = links.find((a) => {
+                const href = a.href || '';
+                if (!isCategory(href) && !/aliexpress\\.us\\/(all-wholesale|store)/i.test(href)) return false;
+                if (/\\/item\\//i.test(href)) return false;
+                const t = (a.innerText || '').trim().toLowerCase();
+                return t.length > 0;
+              });
+              return any ? any.href : null;
+            }"""
+        )
+    except Exception:
+        category_href = None
+
+    if not category_href:
+        # Stable fallback category so warmup still exercises navigation + cookies
+        category_href = "https://www.aliexpress.us/w/wholesale-electronics.html"
+        print(f"[预热] 未发现站内分类链接，使用备用分类: {category_href}")
+    else:
+        print(f"[预热] 打开分类页: {category_href[:120]}")
+
+    try:
+        await page.goto(category_href, wait_until="domcontentloaded", timeout=90000)
+        await page.wait_for_timeout(2000)
+        await _dismiss_aliexpress_popups(page, worker_id=worker_id)
+        if await is_captcha_page_visible(page):
+            print("[预热] 分类页出现验证码，尝试 LLM 通过…")
+            await handle_captcha(page, captcha_state, product_url=category_href)
+        await human_scroll(page, 1600, worker_id=worker_id)
+        await human_idle(page, worker_id=worker_id, seconds=random.uniform(1.0, 2.0))
+    except CaptchaKeepSessionError:
+        print("[预热] 分类页验证码未能通过，继续尝试商品页")
+    except Exception as exc:
+        print(f"[预热] 分类页异常: {exc}")
+
+    product_href: str | None = None
+    try:
+        product_href = await page.evaluate(
+            """() => {
+              const a = Array.from(document.querySelectorAll('a[href*="/item/"]'))
+                .find((el) => /\\/item\\/\\d+/i.test(el.href || ''));
+              return a ? a.href : null;
+            }"""
+        )
+    except Exception:
+        product_href = None
+
+    if product_href:
+        print(f"[预热] 打开商品页: {product_href[:120]}")
+        try:
+            # Prefer human click if the product card is visible on the current page.
+            clicked = False
+            if HUMAN_MOUSE_ENABLED:
+                try:
+                    card = page.locator('a[href*="/item/"]').first
+                    if await card.count() > 0 and await card.is_visible():
+                        clicked = await human_click_locator(page, card, worker_id=worker_id)
+                except Exception:
+                    clicked = False
+            if not clicked:
+                await page.goto(product_href, wait_until="domcontentloaded", timeout=90000)
+            await page.wait_for_timeout(2500)
+            await _dismiss_aliexpress_popups(page, worker_id=worker_id)
+            if await is_captcha_page_visible(page):
+                print("[预热] 商品页出现验证码，尝试 LLM 通过…")
+                await handle_captcha(page, captcha_state, product_url=product_href)
+            await human_scroll(page, 900, worker_id=worker_id)
+            await human_idle(page, worker_id=worker_id, seconds=random.uniform(0.8, 1.5))
+        except CaptchaKeepSessionError:
+            print("[预热] 商品页验证码未能通过，预热结束（保留 session）")
+        except Exception as exc:
+            print(f"[预热] 商品页异常: {exc}")
+    else:
+        print("[预热] 未找到商品链接，跳过商品页预热")
+
+    print("[预热] cookies/session 预热完成，开始从队列抓取")
+
 
 async def extract_ld_json(page: Page) -> list[dict[str, Any]]:
     """从页面提取所有 LD+JSON 结构化数据，自动展平嵌套数组"""
@@ -2777,6 +3133,8 @@ async def fetch_product(page: Page, url: str, captcha_state: dict[str, bool]) ->
             print("  [API] 未拦截到有效 pdp 接口，降级使用 LD+JSON")
     except BrowserRestartRequired:
         raise
+    except CaptchaKeepSessionError:
+        raise
     except NetworkPageError:
         raise
     except MissingPriceError:
@@ -2920,6 +3278,12 @@ class CrawlState:
         self.es_updated = 0
         self.es_upload_failed = 0
         self.es_skipped_existing = 0
+        self._force_stop = False
+
+    def request_stop(self, reason: str = "") -> None:
+        self._force_stop = True
+        if reason:
+            print(f"[停止] {reason}")
 
     async def is_processed(self, url: str) -> bool:
         async with self.lock:
@@ -2994,6 +3358,8 @@ class CrawlState:
                 self.failed += 1
 
     async def should_stop(self) -> bool:
+        if self._force_stop:
+            return True
         if MAX_PRODUCTS <= 0:
             return False
         async with self.stats_lock:
@@ -3151,18 +3517,23 @@ async def browser_worker(
     context = None
     page = None
     captcha_state: dict[str, bool] = {"solved_once": False}
-    print(f"[{worker_label}] 启动")
+    session_warmed = False
+    consecutive_captcha_fails = 0
+    proxy_success_count = 0
+    proxy_label = browser_proxy_label(worker_id)
+    print(f"[{worker_label}] 启动 | 代理模式={PROXY_MODE} | {proxy_label}")
 
     async def shutdown_session(*, clear_profile: bool = False) -> None:
-        nonlocal browser, context, page, captcha_state
+        nonlocal browser, context, page, captcha_state, session_warmed
         await close_browser_session(browser, context, worker_id, clear_profile=clear_profile)
         browser = None
         context = None
         page = None
         captcha_state = {"solved_once": False}
+        session_warmed = False
 
     async def ensure_browser() -> None:
-        nonlocal browser, context, page, captcha_state
+        nonlocal browser, context, page, captcha_state, session_warmed, consecutive_captcha_fails
         if _session_alive(context, page):
             return
         if context is not None or browser is not None:
@@ -3173,16 +3544,49 @@ async def browser_worker(
             clear_profile=False,
         )
         captcha_state = {"solved_once": False}
-        print(f"[{worker_label}] 浏览器已打开（代理: {webshare_proxy_label()}）")
+        session_warmed = False
+        print(f"[{worker_label}] 浏览器已打开（代理: {browser_proxy_label(worker_id)}）")
+        if SESSION_WARMUP:
+            assert page is not None
+            try:
+                await warmup_aliexpress_session(page, captcha_state, worker_id=worker_id)
+                session_warmed = True
+            except CaptchaKeepSessionError as exc:
+                consecutive_captcha_fails += 1
+                print(
+                    f"[{worker_label}] 预热阶段验证码未通过，保留 session: {exc} "
+                    f"(连续失败 {consecutive_captcha_fails}/{PROXY_MAX_CONSECUTIVE_CAPTCHA})"
+                )
+                session_warmed = True
 
     try:
         while True:
             if await state.should_stop():
                 break
+            if (
+                PROXY_MODE == "static"
+                and consecutive_captcha_fails >= PROXY_MAX_CONSECUTIVE_CAPTCHA
+            ):
+                print(
+                    f"[{worker_label}] 代理疑似烧掉：连续 {consecutive_captcha_fails} 次验证码失败。"
+                    f"本代理成功抓取 {proxy_success_count} 个商品。停止 Worker。"
+                )
+                state.request_stop(
+                    f"{worker_label} 代理烧掉，成功 {proxy_success_count} 个 | {proxy_label}"
+                )
+                break
 
             # Claim a URL before opening the browser so idle workers do not sit on about:blank.
             while pending_task is None:
                 if await state.should_stop():
+                    return
+                if (
+                    PROXY_MODE == "static"
+                    and consecutive_captcha_fails >= PROXY_MAX_CONSECUTIVE_CAPTCHA
+                ):
+                    state.request_stop(
+                        f"{worker_label} 代理烧掉，成功 {proxy_success_count} 个 | {proxy_label}"
+                    )
                     return
 
                 item = await task_queue.get()
@@ -3217,10 +3621,17 @@ async def browser_worker(
                 print(
                     f"[{worker_label}] [{index}{'' if total_links <= 0 else f'/{total_links}'}] "
                     f"第 {batch_no} 批 {batch_pos}/{batch_size or '?'} 抓取详情: {url}"
+                    + (
+                        f" | 本代理已成功 {proxy_success_count}"
+                        if PROXY_MODE == "static"
+                        else ""
+                    )
                 )
                 try:
                     product_records = await fetch_product(page, url, captcha_state)
                     if not product_records:
+                        if CAPTCHA_KEEP_SESSION:
+                            raise CaptchaKeepSessionError("未获取到商品数据，保留 session 换下一 URL")
                         raise BrowserRestartRequired("未获取到商品数据，不保存")
 
                     save_result = await state.save_product_records(
@@ -3228,6 +3639,14 @@ async def browser_worker(
                     )
                     if save_result["primary_uploaded"]:
                         await state.finish_url(url)
+                        consecutive_captcha_fails = 0
+                        if save_result.get("primary_uploaded"):
+                            proxy_success_count += 1
+                            if PROXY_MODE == "static":
+                                print(
+                                    f"[{worker_label}] 本代理累计成功: {proxy_success_count} "
+                                    f"({browser_proxy_label(worker_id)})"
+                                )
                     else:
                         await state.append_invalid(
                             invalid_path,
@@ -3243,6 +3662,31 @@ async def browser_worker(
                     task_queue.task_done()
                     pending_task = None
                     await sleep()
+                except CaptchaKeepSessionError as exc:
+                    consecutive_captcha_fails += 1
+                    print(
+                        f"[{worker_label}] {exc} "
+                        f"(连续验证码失败 {consecutive_captcha_fails}/{PROXY_MAX_CONSECUTIVE_CAPTCHA}，"
+                        f"本代理已成功 {proxy_success_count})"
+                    )
+                    await state.append_invalid(
+                        invalid_path,
+                        {
+                            "url": url,
+                            "product_id": product_id_from_url(url),
+                            "error": f"验证码未通过，保留 session 跳过: {exc}",
+                            "date": datetime.now().replace(microsecond=0).isoformat(),
+                            "proxy": browser_proxy_label(worker_id),
+                            "proxy_success_before_skip": proxy_success_count,
+                        },
+                    )
+                    await state.mark_url_done(failed=True)
+                    if state.redis_q is not None:
+                        await asyncio.to_thread(state.redis_q.requeue, url)
+                    await state.release_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    await sleep(short=True)
                 except BrowserRestartRequired:
                     raise
                 except NetworkPageError:
@@ -3274,6 +3718,31 @@ async def browser_worker(
                     continue
 
                 url = pending_task[0]
+                if CAPTCHA_KEEP_SESSION:
+                    # Defensive: map unexpected hard-restart into keep-session path.
+                    consecutive_captcha_fails += 1
+                    print(
+                        f"[{worker_label}] {exc} → 保持 session 模式，跳过当前 URL "
+                        f"(连续失败 {consecutive_captcha_fails}/{PROXY_MAX_CONSECUTIVE_CAPTCHA})"
+                    )
+                    await state.append_invalid(
+                        invalid_path,
+                        {
+                            "url": url,
+                            "product_id": product_id_from_url(url),
+                            "error": f"keep-session 跳过: {exc}",
+                            "date": datetime.now().replace(microsecond=0).isoformat(),
+                            "proxy": browser_proxy_label(worker_id),
+                        },
+                    )
+                    await state.mark_url_done(failed=True)
+                    if state.redis_q is not None:
+                        await asyncio.to_thread(state.redis_q.requeue, url)
+                    await state.release_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    continue
+
                 captcha_restart_counts[url] = captcha_restart_counts.get(url, 0) + 1
                 retry_count = captcha_restart_counts[url]
                 print(
@@ -3325,6 +3794,31 @@ async def browser_worker(
                     f"{MAX_NETWORK_RESTARTS_PER_URL}。"
                 )
                 wipe = should_clear_profile_for_error(exc)
+                if CAPTCHA_KEEP_SESSION and PROXY_MODE == "static":
+                    # static 模式：网络/不完整也不随便换代理，尽量保留 session 换下一 URL
+                    if retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
+                        await state.append_invalid(
+                            invalid_path,
+                            {
+                                "url": url,
+                                "product_id": product_id_from_url(url),
+                                "error": f"static 模式重试耗尽: {exc}",
+                                "date": datetime.now().replace(microsecond=0).isoformat(),
+                                "proxy": browser_proxy_label(worker_id),
+                            },
+                        )
+                        await state.mark_url_done(failed=True)
+                        if state.redis_q is not None:
+                            await asyncio.to_thread(state.redis_q.requeue, url)
+                        await state.release_url(url)
+                        task_queue.task_done()
+                        pending_task = None
+                        print(f"[{worker_label}] 跳过当前 URL，保留 session 继续: {url}")
+                    else:
+                        print(f"[{worker_label}] 保留 session，短暂等待后重试当前商品。")
+                        await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+                    continue
+
                 if retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
                     await shutdown_session(clear_profile=wipe)
                     await state.release_url(url)
@@ -3354,6 +3848,11 @@ async def browser_worker(
             if await state.should_stop():
                 break
     finally:
+        if PROXY_MODE == "static":
+            print(
+                f"[{worker_label}] 代理容量统计: 成功={proxy_success_count} "
+                f"连续验证码失败={consecutive_captcha_fails} | {proxy_label}"
+            )
         await shutdown_session(clear_profile=False)
         print(f"[{worker_label}] 结束")
 
@@ -3520,13 +4019,33 @@ async def redis_queue_feeder(
     index = 0
     idle_rounds = 0
     wait_notice_every = max(12, 60 // max(REDIS_BRPOP_TIMEOUT, 1))  # ~60s
+
+    async def enqueue_local(url: str, idx: int) -> bool:
+        """Put URL into local queue; return False if stop requested (URL requeued to Redis)."""
+        while True:
+            if await state.should_stop():
+                await asyncio.to_thread(redis_q.requeue, url)
+                return False
+            try:
+                await asyncio.wait_for(
+                    task_queue.put((url, idx, 1, idx, 0)),
+                    timeout=1.0,
+                )
+                return True
+            except asyncio.TimeoutError:
+                continue
+
     while True:
         if await state.should_stop():
             break
         url = await asyncio.to_thread(redis_q.blocking_pop, REDIS_BRPOP_TIMEOUT)
+        if await state.should_stop():
+            if url:
+                await asyncio.to_thread(redis_q.requeue, url)
+            break
         if not url:
             idle_rounds += 1
-            if REDIS_WAIT_FOREVER or REDIS_ROLE == "consumer":
+            if REDIS_WAIT_FOREVER:
                 if idle_rounds == 1 or idle_rounds % wait_notice_every == 0:
                     qlen = await asyncio.to_thread(redis_q.queue_length)
                     print(
@@ -3539,13 +4058,22 @@ async def redis_queue_feeder(
             if producer_done.is_set() and redis_q.queue_length() == 0:
                 if idle_rounds >= REDIS_IDLE_EXIT_ROUNDS:
                     break
+            elif producer_done.is_set() and idle_rounds >= REDIS_IDLE_EXIT_ROUNDS:
+                # Consumer/test mode with WAIT_FOREVER=0: exit even if Redis still has URLs
+                # when local workers already stopped (should_stop) — handled above —
+                # or when nobody is draining (idle with producer done).
+                break
             continue
         idle_rounds = 0
         index += 1
-        await task_queue.put((url, index, 1, index, 0))
+        if not await enqueue_local(url, index):
+            break
 
     for _ in range(WORKER_COUNT):
-        await task_queue.put(None)
+        try:
+            await asyncio.wait_for(task_queue.put(None), timeout=1.0)
+        except asyncio.TimeoutError:
+            break
     print(f"[Redis] feeder 结束，共投递 {index} 条到本机 Worker")
 
 
@@ -3641,6 +4169,13 @@ async def main_async() -> None:
         print("或一行 URL：")
         print("  ELASTICSEARCH_URL=http://emuser1:your_password@34.16.105.219:9200")
         raise SystemExit(1)
+    if PROXY_MODE == "static":
+        try:
+            proxies = load_static_proxies()
+            print(f"静态代理池: 已加载 {len(proxies)} 条 from {PROXY_FILE}")
+        except Exception as exc:
+            print(f"错误: static 代理模式无法加载代理文件: {exc}")
+            raise SystemExit(1) from exc
     print(f"详情输出目录: {OUTPUT_DIR}")
     print(f"并发 Worker 数: {WORKER_COUNT}")
     if WORKER_COUNT > 1:
@@ -3648,7 +4183,13 @@ async def main_async() -> None:
     else:
         print(f"浏览器 profile 目录: {USER_DATA_DIR}")
     print(f"浏览器策略: {profile_policy_label()}")
-    print(f"浏览器代理: {webshare_proxy_label()}")
+    print(f"代理模式: {proxy_mode_label()}")
+    print(f"浏览器代理: {browser_proxy_label(0)}")
+    print(
+        f"反检测: stealth={'on' if STEALTH_ENABLED else 'off'} | "
+        f"fingerprint={'on' if FINGERPRINT_ENABLED else 'off'} | "
+        f"human_mouse={'on' if HUMAN_MOUSE_ENABLED else 'off'}"
+    )
     print(f"xAI 验证码: {xai_config_label()}")
     print(f"验证码重试: {captcha_restart_label()}")
     print(f"浏览器硬重启等待: {BROWSER_RESTART_DELAY_SECONDS}s")
