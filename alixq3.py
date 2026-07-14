@@ -189,7 +189,7 @@ CLEAR_PROFILE_ON_HARD_FAIL = os.environ.get("CLEAR_PROFILE_ON_HARD_FAIL", "1").s
 WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
 PRODUCT_PACE_SECONDS = float(os.environ.get("PRODUCT_PACE_SECONDS", "0") or "0")
 
-# pool：遇验证码不求解；换指纹并循环代理（不标记 IP 不可用）；约 30s/商品
+# pool：遇验证码不求解；换指纹并循环代理（不标记 IP 不可用）；约 15s/商品
 if PROXY_MODE == "pool":
     CAPTCHA_KEEP_SESSION = False
     CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("POOL_CAPTCHA_ROUNDS", "0") or "0")
@@ -198,7 +198,7 @@ if PROXY_MODE == "pool":
     # 默认关闭 Grok 过验证码；可用 .env CAPTCHA_AUTO_SOLVE=1 重新打开
     os.environ.setdefault("CAPTCHA_AUTO_SOLVE", "0")
     if "PRODUCT_PACE_SECONDS" not in os.environ:
-        PRODUCT_PACE_SECONDS = 30.0
+        PRODUCT_PACE_SECONDS = 15.0
     SESSION_WARMUP = os.environ.get("SESSION_WARMUP", "1").strip().lower() in (
         "1",
         "true",
@@ -2598,12 +2598,13 @@ async def sleep(short: bool = False) -> None:
 
 
 async def pace_after_product() -> None:
-    """Slow crawl cadence after a successful product (~30s in pool mode)."""
+    """Slow crawl cadence after a successful product (~15s in pool mode)."""
     if PRODUCT_PACE_SECONDS <= 0:
         await sleep()
         return
-    jitter = random.uniform(-3.0, 5.0)
-    delay = max(15.0, PRODUCT_PACE_SECONDS + jitter)
+    jitter = random.uniform(-2.5, 3.5)
+    # Keep pace near the configured target (pool default ~15s).
+    delay = max(10.0, PRODUCT_PACE_SECONDS + jitter)
     print(f"[节奏] 等待 {delay:.1f}s 后再抓下一个商品…")
     await asyncio.sleep(delay)
 

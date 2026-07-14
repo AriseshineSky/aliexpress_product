@@ -4,7 +4,7 @@
 Behavior (forced via env before importing alixq3):
   - PROXY_MODE=pool
   - Concurrent workers from .env WORKER_COUNT (or --workers); capped by proxy count
-  - ~30 seconds pacing between successful products (per worker)
+  - ~15 seconds pacing between successful products (per worker)
   - Captcha: do not solve; cycle proxy + new fingerprint (IPs stay reusable, never burned)
   - Same Redis URL queue as the main crawler
 
@@ -41,8 +41,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pace",
         type=float,
-        default=30.0,
-        help="Seconds to wait after each successful product (default 30)",
+        default=15.0,
+        help="Seconds to wait after each successful product (default 15)",
     )
     parser.add_argument(
         "--max-products",

@@ -84,7 +84,7 @@ start.bat
 |--------------|------|
 | `rotate`（默认） | 现有 Webshare 网关 + rotate，硬失败可换 IP |
 | `static` | 使用 `data/*.txt` 固定代理（`host:port:user:pass`），同一会话保持 IP/cookies |
-| `pool` | `.env` 的 `POOL_PROXIES`；遇验证码不求解，换指纹并循环代理（IP 不屏蔽）；约 30s/商品；并发读 `WORKER_COUNT` |
+| `pool` | `.env` 的 `POOL_PROXIES`；遇验证码不求解，换指纹并循环代理（IP 不屏蔽）；约 15s/商品；并发读 `WORKER_COUNT` |
 | `direct` | 本机出口 IP（无代理） |
 
 `static` 模式会先预热首页→分类→商品页，验证码 LLM 失败后**保留 session**并换下一 URL；连续失败达到 `PROXY_MAX_CONSECUTIVE_CAPTCHA` 后停止该 Worker。
@@ -102,7 +102,7 @@ WORKER_COUNT=3
 .venv/bin/python scripts/seed_fingerprints_redis.py --count 100 --diverse
 
 # 抓取机（并发数用 .env WORKER_COUNT；可用 --workers 临时覆盖）
-.venv/bin/python scripts/run_fixed_pool.py --pace 30 --headless 0
+.venv/bin/python scripts/run_fixed_pool.py --pace 15 --headless 0
 ```
 
 反检测（默认开启）：`playwright-stealth` + 与代理绑定的 Canvas/WebGL 指纹池（`data/fingerprints.json`）+ 贝塞尔鼠标轨迹。可用 `STEALTH_ENABLED` / `FINGERPRINT_ENABLED` / `HUMAN_MOUSE_ENABLED` 开关。
