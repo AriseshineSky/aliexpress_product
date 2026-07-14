@@ -518,7 +518,7 @@ class ProductParseTestCase(unittest.TestCase):
             self.assertEqual(len(proxies), 5)
             self.assertEqual(proxies[0].host, "63.141.62.32")
             self.assertEqual(alixq3.WORKER_COUNT, 3)
-            self.assertEqual(alixq3.CAPTCHA_RECOVERY_ROUNDS, 1)
+            self.assertEqual(alixq3.CAPTCHA_RECOVERY_ROUNDS, 0)
             self.assertTrue(alixq3.REDIS_FP_ENABLED)
             a = alixq3.assign_pool_proxy(0)
             b = alixq3.assign_pool_proxy(1)
@@ -526,6 +526,17 @@ class ProductParseTestCase(unittest.TestCase):
                 f"{a.host}:{a.port}",
                 f"{b.host}:{b.port}",
             )
+            # Captcha rotate must not burn proxies — all remain assignable.
+            first = f"{a.host}:{a.port}"
+            alixq3.rotate_pool_proxy(0, reason="test")
+            cycled = alixq3.get_static_proxy_for_worker(0)
+            self.assertNotEqual(first, f"{cycled.host}:{cycled.port}")
+            # Original IP must still be usable by another worker after release.
+            alixq3._pool_in_use.pop(0, None)
+            alixq3._worker_static_proxies.pop(0, None)
+            again = alixq3.assign_pool_proxy(0)
+            all_eps = {f"{p.host}:{p.port}" for p in alixq3.load_fixed_proxy_pool()}
+            self.assertIn(f"{again.host}:{again.port}", all_eps)
         finally:
             os.environ.pop("PROXY_MODE", None)
             os.environ.pop("WORKER_COUNT", None)

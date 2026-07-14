@@ -115,7 +115,7 @@ WEBSHARE_ROTATE = os.environ.get("WEBSHARE_ROTATE", "1").strip().lower() in ("1"
 # 代理模式：
 #   rotate — 现有 Webshare 网关 + rotate（硬失败可换 IP）
 #   static — 使用 data/ 里固定住宅代理列表（同一会话保持同一 IP / cookies）
-#   pool   — .env POOL_PROXIES 小代理池；验证码 1 轮失败即换代理+指纹
+#   pool   — .env POOL_PROXIES 小代理池；遇验证码换指纹并循环代理（不屏蔽 IP）
 #   direct — 不走代理，用本机出口 IP（本地指纹/联调）
 PROXY_MODE = (os.environ.get("PROXY_MODE", "rotate") or "rotate").strip().lower()
 if PROXY_MODE in ("none", "off", "local", "no_proxy", "noproxy"):
@@ -163,7 +163,6 @@ SESSION_WARMUP = os.environ.get(
     "1" if PROXY_MODE in ("static", "pool") else "0",
 ).strip().lower() in ("1", "true", "yes", "on")
 # 验证码 LLM 尝试失败后：是否保留浏览器 session/cookies/代理，跳过当前 URL 继续下一个
-# pool 模式默认关闭：验证码失败视为代理被屏蔽，需换 IP+指纹
 CAPTCHA_KEEP_SESSION = os.environ.get(
     "CAPTCHA_KEEP_SESSION",
     "1" if PROXY_MODE == "static" else "0",
@@ -190,15 +189,16 @@ CLEAR_PROFILE_ON_HARD_FAIL = os.environ.get("CLEAR_PROFILE_ON_HARD_FAIL", "1").s
 WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
 PRODUCT_PACE_SECONDS = float(os.environ.get("PRODUCT_PACE_SECONDS", "0") or "0")
 
-# pool：验证码 1 轮、失败换代理+指纹、约 30s/商品；并发读 WORKER_COUNT（不超过代理数）
+# pool：遇验证码不求解；换指纹并循环代理（不标记 IP 不可用）；约 30s/商品
 if PROXY_MODE == "pool":
     CAPTCHA_KEEP_SESSION = False
-    CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("POOL_CAPTCHA_ROUNDS", "1") or "1")
+    CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("POOL_CAPTCHA_ROUNDS", "0") or "0")
     MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("POOL_CAPTCHA_RESTARTS", "0") or "0")
     MAX_NETWORK_RESTARTS_PER_URL = int(os.environ.get("POOL_NETWORK_RESTARTS", "1") or "1")
+    # 默认关闭 Grok 过验证码；可用 .env CAPTCHA_AUTO_SOLVE=1 重新打开
+    os.environ.setdefault("CAPTCHA_AUTO_SOLVE", "0")
     if "PRODUCT_PACE_SECONDS" not in os.environ:
         PRODUCT_PACE_SECONDS = 30.0
-    # 默认先逛首页预热；验证码一律先走 Grok（CAPTCHA_AUTO_SOLVE）
     SESSION_WARMUP = os.environ.get("SESSION_WARMUP", "1").strip().lower() in (
         "1",
         "true",
@@ -341,7 +341,6 @@ class StaticProxy:
 
 _static_proxies_cache: list[StaticProxy] | None = None
 _worker_static_proxies: dict[int, StaticProxy] = {}
-_pool_burned: set[str] = set()
 _pool_cursor: int = 0
 _pool_in_use: dict[int, str] = {}  # worker_id -> host:port (exclusive while active)
 
@@ -436,7 +435,7 @@ def _pool_endpoints_in_use_by_others(worker_id: int) -> set[str]:
 
 
 def assign_pool_proxy(worker_id: int = 0) -> StaticProxy:
-    """Give worker an exclusive non-burned pool proxy (multi-worker safe)."""
+    """Give worker an exclusive pool proxy (round-robin; IPs stay reusable)."""
     global _pool_cursor
     proxies = load_static_proxies()
     others = _pool_endpoints_in_use_by_others(worker_id)
@@ -444,29 +443,12 @@ def assign_pool_proxy(worker_id: int = 0) -> StaticProxy:
     def pick_from(candidates: list[StaticProxy]) -> StaticProxy | None:
         if not candidates:
             return None
-        start = _pool_cursor % len(proxies)
+        start = (_pool_cursor + 1) % len(proxies)
         ordered = sorted(candidates, key=lambda p: (p.index - start) % len(proxies))
         return ordered[0]
 
-    free = [
-        p
-        for p in proxies
-        if _proxy_endpoint(p) not in _pool_burned and _proxy_endpoint(p) not in others
-    ]
-    proxy = pick_from(free)
-    if proxy is None:
-        # Prefer sharing a burned-reset over taking a peer's live proxy.
-        if len(_pool_burned) >= len(proxies):
-            print("[代理池] 全部代理都曾被屏蔽，重置屏蔽名单后继续")
-            _pool_burned.clear()
-        free = [
-            p
-            for p in proxies
-            if _proxy_endpoint(p) not in _pool_burned and _proxy_endpoint(p) not in others
-        ]
-        proxy = pick_from(free) or pick_from(
-            [p for p in proxies if _proxy_endpoint(p) not in others]
-        ) or proxies[worker_id % len(proxies)]
+    free = [p for p in proxies if _proxy_endpoint(p) not in others]
+    proxy = pick_from(free) or proxies[worker_id % len(proxies)]
 
     _pool_cursor = proxy.index
     _worker_static_proxies[worker_id] = proxy
@@ -526,32 +508,29 @@ def bind_fingerprint_for_proxy(proxy: StaticProxy, *, prefer_redis: bool = True)
 
 
 def rotate_pool_proxy(worker_id: int = 0, *, reason: str = "") -> StaticProxy | None:
-    """Mark current pool proxy burned, assign next exclusive proxy + Redis/local fingerprint."""
+    """Cycle to next exclusive pool proxy + new fingerprint. Never marks IP unavailable."""
     if PROXY_MODE != "pool":
         return None
 
-    proxies = load_static_proxies()
     current = _worker_static_proxies.get(worker_id)
     if current is not None:
-        burned_key = _proxy_endpoint(current)
-        _pool_burned.add(burned_key)
         _pool_in_use.pop(worker_id, None)
         _worker_static_proxies.pop(worker_id, None)
         print(
-            f"[代理池] 标记屏蔽: {current.label()}"
+            f"[代理池] 循环放下: {current.label()}"
             + (f" | 原因: {reason}" if reason else "")
-            + f" | 已屏蔽 {len(_pool_burned)}/{len(proxies)}"
+            + "（IP 仍可复用，不标记屏蔽）"
         )
 
     next_proxy = assign_pool_proxy(worker_id)
     if FINGERPRINT_ENABLED:
         fp = bind_fingerprint_for_proxy(next_proxy, prefer_redis=True)
         print(
-            f"[代理池] 切换到 {next_proxy.label()}"
+            f"[代理池] 循环到 {next_proxy.label()}"
             + (f" | 新指纹 {fp.label()}" if fp is not None else "")
         )
     else:
-        print(f"[代理池] 切换到 {next_proxy.label()}")
+        print(f"[代理池] 循环到 {next_proxy.label()}")
     return next_proxy
 
 
@@ -831,7 +810,7 @@ def browser_proxy_label(worker_id: int = 0) -> str:
         except Exception as exc:
             return f"{PROXY_MODE} 模式错误: {exc}"
         prefix = "pool" if PROXY_MODE == "pool" else "static"
-        return f"{prefix} {proxy.label()} (burned={len(_pool_burned) if PROXY_MODE == 'pool' else 0})"
+        return f"{prefix} {proxy.label()}"
     return webshare_proxy_label()
 
 
@@ -842,9 +821,9 @@ def proxy_mode_label() -> str:
         fp_src = "Redis指纹队列" if (REDIS_ENABLED and REDIS_FP_ENABLED) else "本地指纹"
         return (
             f"pool .env 代理 {len(FIXED_PROXY_POOL)} 条 | workers={WORKER_COUNT} | "
-            f"captcha_rounds={CAPTCHA_RECOVERY_ROUNDS} | "
+            f"captcha_solve={'on' if CAPTCHA_RECOVERY_ROUNDS > 0 else 'off'} | "
             f"pace≈{PRODUCT_PACE_SECONDS:.0f}s/商品 | "
-            f"屏蔽后换代理+{fp_src}"
+            f"验证码→换指纹并循环代理（不屏蔽）+{fp_src}"
         )
     if PROXY_MODE == "static":
         return (
@@ -858,9 +837,11 @@ def proxy_mode_label() -> str:
 
 def captcha_restart_label() -> str:
     if PROXY_MODE == "pool":
+        if CAPTCHA_RECOVERY_ROUNDS <= 0:
+            return "遇验证码不求解；清空 profile，换指纹并循环代理（IP 不屏蔽）"
         return (
             f"验证码最多 {CAPTCHA_RECOVERY_ROUNDS} 轮；"
-            "未通过即判定屏蔽，清空 profile 并切换代理+指纹"
+            "未通过则清空 profile，换指纹并循环代理（IP 不屏蔽）"
         )
     total = CAPTCHA_RECOVERY_ROUNDS * MAX_CAPTCHA_RESTARTS_PER_URL
     return (
@@ -3053,6 +3034,13 @@ async def handle_captcha(
             "继续尝试自动处理..."
         )
 
+    if CAPTCHA_RECOVERY_ROUNDS <= 0:
+        if PROXY_MODE == "pool":
+            raise BrowserRestartRequired(
+                "检测到验证码；pool 模式不求解，换指纹并循环代理（IP 不屏蔽）"
+            )
+        raise BrowserRestartRequired("检测到验证码，且 CAPTCHA_RECOVERY_ROUNDS=0，硬重启浏览器")
+
     for attempt in range(1, CAPTCHA_RECOVERY_ROUNDS + 1):
         if await captcha_cleared_after_refresh(page):
             return False
@@ -3899,7 +3887,7 @@ async def browser_worker(
                 if PROXY_MODE == "pool" and warmup_rotate_attempts < max_warmup_rotates:
                     warmup_rotate_attempts += 1
                     print(
-                        f"[{worker_label}] 预热失败，换代理+指纹后重开 "
+                        f"[{worker_label}] 预热失败，换指纹并循环代理后重开 "
                         f"({warmup_rotate_attempts}/{max_warmup_rotates}): {exc}"
                     )
                     await shutdown_session(clear_profile=True)
@@ -3988,7 +3976,7 @@ async def browser_worker(
                     product_records = await fetch_product(page, url, captcha_state)
                     if not product_records:
                         if PROXY_MODE == "pool":
-                            raise BrowserRestartRequired("未获取到商品数据，判定代理被屏蔽")
+                            raise BrowserRestartRequired("未获取到商品数据，换指纹并循环代理")
                         if CAPTCHA_KEEP_SESSION:
                             raise CaptchaKeepSessionError("未获取到商品数据，保留 session 换下一 URL")
                         raise BrowserRestartRequired("未获取到商品数据，不保存")
@@ -4026,14 +4014,13 @@ async def browser_worker(
                         await sleep()
                 except CaptchaKeepSessionError as exc:
                     if PROXY_MODE == "pool":
-                        # Keep-session is off for pool by default; treat as block just in case.
-                        print(f"[{worker_label}] 验证码未通过，切换代理+指纹: {exc}")
+                        print(f"[{worker_label}] 验证码出现，换指纹并循环代理: {exc}")
                         await state.append_invalid(
                             invalid_path,
                             {
                                 "url": url,
                                 "product_id": product_id_from_url(url),
-                                "error": f"pool 验证码失败换代理: {exc}",
+                                "error": f"pool 验证码换指纹循环代理: {exc}",
                                 "date": datetime.now().replace(microsecond=0).isoformat(),
                                 "proxy": browser_proxy_label(worker_id),
                             },
@@ -4105,13 +4092,13 @@ async def browser_worker(
 
                 url = pending_task[0]
                 if PROXY_MODE == "pool":
-                    print(f"[{worker_label}] {exc} → 判定当前代理被屏蔽，切换代理+指纹")
+                    print(f"[{worker_label}] {exc} → 换指纹并循环代理（IP 不屏蔽）")
                     await state.append_invalid(
                         invalid_path,
                         {
                             "url": url,
                             "product_id": product_id_from_url(url),
-                            "error": f"pool 屏蔽换代理: {exc}",
+                            "error": f"pool 换指纹循环代理: {exc}",
                             "date": datetime.now().replace(microsecond=0).isoformat(),
                             "proxy": browser_proxy_label(worker_id),
                         },
@@ -4204,13 +4191,13 @@ async def browser_worker(
                 )
                 wipe = should_clear_profile_for_error(exc)
                 if PROXY_MODE == "pool" and retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
-                    print(f"[{worker_label}] 网络/不完整失败，切换代理+指纹: {exc}")
+                    print(f"[{worker_label}] 网络/不完整失败，换指纹并循环代理: {exc}")
                     await state.append_invalid(
                         invalid_path,
                         {
                             "url": url,
                             "product_id": product_id_from_url(url),
-                            "error": f"pool 网络失败换代理: {exc}",
+                            "error": f"pool 网络失败循环代理: {exc}",
                             "date": datetime.now().replace(microsecond=0).isoformat(),
                             "proxy": browser_proxy_label(worker_id),
                         },

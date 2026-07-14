@@ -84,12 +84,12 @@ start.bat
 |--------------|------|
 | `rotate`（默认） | 现有 Webshare 网关 + rotate，硬失败可换 IP |
 | `static` | 使用 `data/*.txt` 固定代理（`host:port:user:pass`），同一会话保持 IP/cookies |
-| `pool` | `.env` 的 `POOL_PROXIES`；验证码 1 轮失败即换代理+指纹；约 30s/商品；并发读 `WORKER_COUNT` |
+| `pool` | `.env` 的 `POOL_PROXIES`；遇验证码不求解，换指纹并循环代理（IP 不屏蔽）；约 30s/商品；并发读 `WORKER_COUNT` |
 | `direct` | 本机出口 IP（无代理） |
 
 `static` 模式会先预热首页→分类→商品页，验证码 LLM 失败后**保留 session**并换下一 URL；连续失败达到 `PROXY_MAX_CONSECUTIVE_CAPTCHA` 后停止该 Worker。
 
-`pool` 模式监听同一 Redis URL 队列；被屏蔽时清空 profile，换下一个空闲代理，并优先从 Redis 指纹队列 `alixq3:fps` 领取新指纹（队列空则本地 regenerate）。代理写在 `.env`：
+`pool` 模式监听同一 Redis URL 队列；出现验证码时不清求解、不清屏蔽 IP，清空 profile 后换指纹并循环到下一个空闲代理（原 IP 仍可复用），优先从 Redis 指纹队列 `alixq3:fps` 领指纹。代理写在 `.env`：
 
 ```bash
 PROXY_MODE=pool

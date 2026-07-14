@@ -5,7 +5,7 @@ Behavior (forced via env before importing alixq3):
   - PROXY_MODE=pool
   - Concurrent workers from .env WORKER_COUNT (or --workers); capped by proxy count
   - ~30 seconds pacing between successful products (per worker)
-  - Captcha: 1 recovery round; failure → switch proxy + fingerprint (Redis queue preferred)
+  - Captcha: do not solve; cycle proxy + new fingerprint (IPs stay reusable, never burned)
   - Same Redis URL queue as the main crawler
 
 Fingerprint producer (another machine/process):
@@ -86,12 +86,13 @@ def _apply_env(args: argparse.Namespace) -> None:
         os.environ["HEADLESS"] = str(args.headless)
     os.environ["PRODUCT_PACE_SECONDS"] = str(args.pace)
     os.environ["MAX_PRODUCTS"] = str(args.max_products)
-    os.environ["POOL_CAPTCHA_ROUNDS"] = "1"
+    # 遇验证码不求解：换指纹 + 循环代理（不屏蔽 IP）
+    os.environ["POOL_CAPTCHA_ROUNDS"] = "0"
     os.environ["POOL_CAPTCHA_RESTARTS"] = "0"
     os.environ["POOL_NETWORK_RESTARTS"] = "1"
     os.environ["CAPTCHA_KEEP_SESSION"] = "0"
     os.environ["SESSION_WARMUP"] = "0" if args.no_warmup else "1"
-    os.environ["CAPTCHA_AUTO_SOLVE"] = "1"
+    os.environ["CAPTCHA_AUTO_SOLVE"] = "0"
     os.environ["CLEAR_PROFILE_ON_HARD_FAIL"] = "1"
     os.environ["FINGERPRINT_ENABLED"] = "1"
     os.environ["STEALTH_ENABLED"] = "1"
@@ -123,7 +124,10 @@ def main() -> None:
         )
     print(f"节奏: ~{alixq3.PRODUCT_PACE_SECONDS:.0f}s/商品/Worker")
     print(f"预热: {'on' if alixq3.SESSION_WARMUP else 'off'}（首页→分类→商品）")
-    print(f"验证码: Grok={alixq3.CAPTCHA_AUTO_SOLVE} 轮数={alixq3.CAPTCHA_RECOVERY_ROUNDS}")
+    print(
+        f"验证码: 不求解（轮数={alixq3.CAPTCHA_RECOVERY_ROUNDS}）；"
+        "出现则换指纹并循环代理，IP 不屏蔽"
+    )
     print(f"Redis URL 队列: {alixq3.REDIS_ROLE if alixq3.REDIS_ENABLED else '未配置'}")
     if alixq3.REDIS_ENABLED and alixq3.REDIS_FP_ENABLED:
         try:
@@ -132,7 +136,7 @@ def main() -> None:
         except Exception as exc:
             print(f"Redis 指纹队列: 连接失败 ({exc})")
     else:
-        print("Redis 指纹队列: off（屏蔽后本地 regenerate）")
+        print("Redis 指纹队列: off（循环时本地 regenerate）")
     if args.regen_fingerprints:
         alixq3.prepare_pool_fingerprints(force_regenerate=True)
     print()
