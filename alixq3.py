@@ -29,11 +29,18 @@ from stealth_fp import (
     HUMAN_MOUSE_ENABLED,
     STEALTH_ENABLED,
     apply_stealth_and_fingerprint,
+    ensure_diverse_fingerprints,
+    fingerprint_from_dict,
     fingerprint_key_for_worker,
+    fingerprint_to_dict,
     human_click_locator,
     human_idle,
     human_scroll,
+    get_stored_fingerprint,
     load_or_create_fingerprint,
+    mint_random_fingerprint,
+    rebind_and_save_fingerprint,
+    regenerate_fingerprint,
 )
 
 
@@ -108,12 +115,46 @@ WEBSHARE_ROTATE = os.environ.get("WEBSHARE_ROTATE", "1").strip().lower() in ("1"
 # 代理模式：
 #   rotate — 现有 Webshare 网关 + rotate（硬失败可换 IP）
 #   static — 使用 data/ 里固定住宅代理列表（同一会话保持同一 IP / cookies）
+#   pool   — .env POOL_PROXIES 小代理池；验证码 1 轮失败即换代理+指纹
+#   direct — 不走代理，用本机出口 IP（本地指纹/联调）
 PROXY_MODE = (os.environ.get("PROXY_MODE", "rotate") or "rotate").strip().lower()
-if PROXY_MODE not in ("rotate", "static"):
+if PROXY_MODE in ("none", "off", "local", "no_proxy", "noproxy"):
+    PROXY_MODE = "direct"
+if PROXY_MODE not in ("rotate", "static", "direct", "pool"):
     PROXY_MODE = "rotate"
+
+
+def _parse_pool_proxies_env() -> tuple[str, ...]:
+    """Load pool proxies from ``POOL_PROXIES`` in .env.
+
+    Accepts newline / ``|`` / ``;`` separated ``host:port:user:pass`` entries.
+    """
+    raw = os.environ.get("POOL_PROXIES", "").strip()
+    if not raw:
+        return ()
+    # Strip wrapping quotes that some .env editors add.
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1]
+    lines: list[str] = []
+    for part in re.split(r"[\n|;]+", raw):
+        line = part.strip()
+        if not line or line.startswith("#"):
+            continue
+        lines.append(line)
+    return tuple(lines)
+
+
+# pool 模式代理列表（来自 .env POOL_PROXIES，勿把真实账号写进代码）
+FIXED_PROXY_POOL: tuple[str, ...] = _parse_pool_proxies_env()
+
 _DEFAULT_PROXY_FILE = BASE_DIR / "data" / "Webshare 1000 proxies.txt"
+_DEFAULT_POOL_FILE = BASE_DIR / "data" / "fixed_proxy_pool.txt"
 PROXY_FILE = Path(
-    os.environ.get("PROXY_FILE", str(_DEFAULT_PROXY_FILE)).strip() or str(_DEFAULT_PROXY_FILE)
+    os.environ.get(
+        "PROXY_FILE",
+        str(_DEFAULT_POOL_FILE if PROXY_MODE == "pool" else _DEFAULT_PROXY_FILE),
+    ).strip()
+    or str(_DEFAULT_PROXY_FILE)
 )
 PROXY_INDEX = max(0, int(os.environ.get("PROXY_INDEX", "0") or "0"))
 # static 模式下启动后先逛首页/分类/商品页做 cookies 预热
@@ -122,6 +163,7 @@ SESSION_WARMUP = os.environ.get(
     "1" if PROXY_MODE == "static" else "0",
 ).strip().lower() in ("1", "true", "yes", "on")
 # 验证码 LLM 尝试失败后：是否保留浏览器 session/cookies/代理，跳过当前 URL 继续下一个
+# pool 模式默认关闭：验证码失败视为代理被屏蔽，需换 IP+指纹
 CAPTCHA_KEEP_SESSION = os.environ.get(
     "CAPTCHA_KEEP_SESSION",
     "1" if PROXY_MODE == "static" else "0",
@@ -130,7 +172,6 @@ CAPTCHA_KEEP_SESSION = os.environ.get(
 PROXY_MAX_CONSECUTIVE_CAPTCHA = max(
     1, int(os.environ.get("PROXY_MAX_CONSECUTIVE_CAPTCHA", "3") or "3")
 )
-
 HEADLESS = os.environ.get("HEADLESS", "0").strip().lower() in ("1", "true", "yes", "on")
 CAPTCHA_WAIT_SECONDS = 120
 CAPTCHA_MAX_ROUNDS = 30
@@ -147,6 +188,35 @@ CLEAR_PROFILE_ON_HARD_FAIL = os.environ.get("CLEAR_PROFILE_ON_HARD_FAIL", "1").s
     "on",
 )
 WORKER_COUNT = max(1, int(os.environ.get("WORKER_COUNT", "1") or "1"))
+PRODUCT_PACE_SECONDS = float(os.environ.get("PRODUCT_PACE_SECONDS", "0") or "0")
+
+# pool：验证码 1 轮、失败换代理+指纹、约 30s/商品；并发读 WORKER_COUNT（不超过代理数）
+if PROXY_MODE == "pool":
+    CAPTCHA_KEEP_SESSION = False
+    CAPTCHA_RECOVERY_ROUNDS = int(os.environ.get("POOL_CAPTCHA_ROUNDS", "1") or "1")
+    MAX_CAPTCHA_RESTARTS_PER_URL = int(os.environ.get("POOL_CAPTCHA_RESTARTS", "0") or "0")
+    MAX_NETWORK_RESTARTS_PER_URL = int(os.environ.get("POOL_NETWORK_RESTARTS", "1") or "1")
+    if "PRODUCT_PACE_SECONDS" not in os.environ:
+        PRODUCT_PACE_SECONDS = 30.0
+    # 默认先逛首页预热；验证码一律先走 Grok（CAPTCHA_AUTO_SOLVE）
+    SESSION_WARMUP = os.environ.get("SESSION_WARMUP", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    _pool_proxy_n = len(FIXED_PROXY_POOL)
+    if _pool_proxy_n <= 0:
+        print(
+            "[pool] 警告: .env 未配置 POOL_PROXIES（host:port:user:pass，多条用换行或 | 分隔）"
+        )
+    elif WORKER_COUNT > _pool_proxy_n:
+        print(
+            f"[pool] WORKER_COUNT={WORKER_COUNT} 超过代理数 {_pool_proxy_n}，"
+            f"并发限制为 {_pool_proxy_n}"
+        )
+    if _pool_proxy_n > 0:
+        WORKER_COUNT = max(1, min(WORKER_COUNT, _pool_proxy_n))
 
 # 0 表示不限制；本地试跑可设 MAX_PRODUCTS=1
 MAX_PRODUCTS = int(os.environ.get("MAX_PRODUCTS", "0") or "0")
@@ -157,6 +227,12 @@ REQUEST_DELAY_MS = (2000, 4000)
 REDIS_URL = (os.environ.get("REDIS_URL") or os.environ.get("redis") or "").strip().strip('"').strip("'")
 REDIS_ENABLED = bool(REDIS_URL)
 REDIS_QUEUE_KEY = os.environ.get("REDIS_QUEUE_KEY", "alixq3:urls").strip() or "alixq3:urls"
+REDIS_FP_QUEUE_KEY = os.environ.get("REDIS_FP_QUEUE_KEY", "alixq3:fps").strip() or "alixq3:fps"
+# pool 默认优先从 Redis 指纹队列取指纹；无 Redis 或队列空时本地 regenerate
+REDIS_FP_ENABLED = os.environ.get(
+    "REDIS_FP_ENABLED",
+    "1" if PROXY_MODE == "pool" else "0",
+).strip().lower() in ("1", "true", "yes", "on")
 REDIS_SEEN_KEY = os.environ.get("REDIS_SEEN_KEY", "alixq3:seen").strip() or "alixq3:seen"
 REDIS_CLAIM_PREFIX = os.environ.get("REDIS_CLAIM_PREFIX", "alixq3:claim:").strip() or "alixq3:claim:"
 REDIS_SEED_LOCK_KEY = os.environ.get("REDIS_SEED_LOCK_KEY", "alixq3:seed_lock").strip() or "alixq3:seed_lock"
@@ -265,11 +341,65 @@ class StaticProxy:
 
 _static_proxies_cache: list[StaticProxy] | None = None
 _worker_static_proxies: dict[int, StaticProxy] = {}
+_pool_burned: set[str] = set()
+_pool_cursor: int = 0
+_pool_in_use: dict[int, str] = {}  # worker_id -> host:port (exclusive while active)
+
+
+def _parse_proxy_line(line: str, index: int) -> StaticProxy | None:
+    parts = line.split(":")
+    if len(parts) < 4:
+        return None
+    host, port, username, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
+    if not host or not port:
+        return None
+    return StaticProxy(
+        host=host.strip(),
+        port=port.strip(),
+        username=username.strip(),
+        password=password.strip(),
+        index=index,
+    )
+
+
+def write_fixed_proxy_pool_file(path: Path | None = None) -> Path:
+    """Persist FIXED_PROXY_POOL to disk (under data/, gitignored)."""
+    out = path or _DEFAULT_POOL_FILE
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(FIXED_PROXY_POOL) + "\n", encoding="utf-8")
+    return out
+
+
+def load_fixed_proxy_pool() -> list[StaticProxy]:
+    """Load the pool proxies from ``.env`` ``POOL_PROXIES`` (optionally mirrored to PROXY_FILE)."""
+    lines = FIXED_PROXY_POOL or _parse_pool_proxies_env()
+    proxies: list[StaticProxy] = []
+    for raw in lines:
+        proxy = _parse_proxy_line(raw.strip(), len(proxies))
+        if proxy is not None:
+            proxies.append(proxy)
+    if not proxies:
+        raise RuntimeError(
+            "POOL_PROXIES 为空或格式无效。请在 .env 配置，例如：\n"
+            "POOL_PROXIES=\"1.2.3.4:8080:user:pass|5.6.7.8:9090:user:pass\""
+        )
+    return proxies
 
 
 def load_static_proxies(path: Path | None = None) -> list[StaticProxy]:
     """Load proxies from ``host:port:user:pass`` text file (one per line)."""
     global _static_proxies_cache
+    if PROXY_MODE == "pool" and path is None:
+        if _static_proxies_cache is not None:
+            return _static_proxies_cache
+        proxies = load_fixed_proxy_pool()
+        try:
+            write_fixed_proxy_pool_file(PROXY_FILE if PROXY_FILE.name else _DEFAULT_POOL_FILE)
+        except OSError:
+            pass
+        _static_proxies_cache = proxies
+        return proxies
+
     proxy_path = path or PROXY_FILE
     if _static_proxies_cache is not None and path is None:
         return _static_proxies_cache
@@ -277,29 +407,18 @@ def load_static_proxies(path: Path | None = None) -> list[StaticProxy]:
     if not proxy_path.exists():
         raise FileNotFoundError(f"代理文件不存在: {proxy_path}")
 
-    proxies: list[StaticProxy] = []
+    proxies = []
     for line_no, raw in enumerate(
         proxy_path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
     ):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split(":")
-        if len(parts) < 4:
+        proxy = _parse_proxy_line(line, len(proxies))
+        if proxy is None:
             print(f"[代理] 跳过格式异常行 {line_no}: {line[:40]}")
             continue
-        host, port, username, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
-        if not host or not port:
-            continue
-        proxies.append(
-            StaticProxy(
-                host=host.strip(),
-                port=port.strip(),
-                username=username.strip(),
-                password=password.strip(),
-                index=len(proxies),
-            )
-        )
+        proxies.append(proxy)
 
     if not proxies:
         raise RuntimeError(f"代理文件为空或格式无效: {proxy_path}")
@@ -308,15 +427,132 @@ def load_static_proxies(path: Path | None = None) -> list[StaticProxy]:
     return proxies
 
 
+def _proxy_endpoint(proxy: StaticProxy) -> str:
+    return f"{proxy.host}:{proxy.port}"
+
+
+def _pool_endpoints_in_use_by_others(worker_id: int) -> set[str]:
+    return {ep for wid, ep in _pool_in_use.items() if wid != worker_id}
+
+
+def assign_pool_proxy(worker_id: int = 0) -> StaticProxy:
+    """Give worker an exclusive non-burned pool proxy (multi-worker safe)."""
+    global _pool_cursor
+    proxies = load_static_proxies()
+    others = _pool_endpoints_in_use_by_others(worker_id)
+
+    def pick_from(candidates: list[StaticProxy]) -> StaticProxy | None:
+        if not candidates:
+            return None
+        start = _pool_cursor % len(proxies)
+        ordered = sorted(candidates, key=lambda p: (p.index - start) % len(proxies))
+        return ordered[0]
+
+    free = [
+        p
+        for p in proxies
+        if _proxy_endpoint(p) not in _pool_burned and _proxy_endpoint(p) not in others
+    ]
+    proxy = pick_from(free)
+    if proxy is None:
+        # Prefer sharing a burned-reset over taking a peer's live proxy.
+        if len(_pool_burned) >= len(proxies):
+            print("[代理池] 全部代理都曾被屏蔽，重置屏蔽名单后继续")
+            _pool_burned.clear()
+        free = [
+            p
+            for p in proxies
+            if _proxy_endpoint(p) not in _pool_burned and _proxy_endpoint(p) not in others
+        ]
+        proxy = pick_from(free) or pick_from(
+            [p for p in proxies if _proxy_endpoint(p) not in others]
+        ) or proxies[worker_id % len(proxies)]
+
+    _pool_cursor = proxy.index
+    _worker_static_proxies[worker_id] = proxy
+    _pool_in_use[worker_id] = _proxy_endpoint(proxy)
+    return proxy
+
+
 def get_static_proxy_for_worker(worker_id: int = 0) -> StaticProxy:
-    """Assign a fixed proxy to a worker (PROXY_INDEX + worker_id)."""
+    """Assign a fixed proxy to a worker (PROXY_INDEX + worker_id), or exclusive pool proxy."""
     if worker_id in _worker_static_proxies:
         return _worker_static_proxies[worker_id]
     proxies = load_static_proxies()
+    if PROXY_MODE == "pool":
+        return assign_pool_proxy(worker_id)
     idx = (PROXY_INDEX + worker_id) % len(proxies)
     proxy = proxies[idx]
     _worker_static_proxies[worker_id] = proxy
     return proxy
+
+
+def prepare_pool_fingerprints(*, force_regenerate: bool = False) -> None:
+    """Ensure each pool proxy has a distinct persisted fingerprint (local fallback)."""
+    if PROXY_MODE != "pool" or not FINGERPRINT_ENABLED:
+        return
+    keys = [f"proxy:{_proxy_endpoint(p)}" for p in load_fixed_proxy_pool()]
+    fps = ensure_diverse_fingerprints(
+        keys, timezone_id="America/New_York", force_regenerate=force_regenerate
+    )
+    print(f"[指纹池] 已为 {len(fps)} 个代理准备差异化指纹：")
+    for fp in fps:
+        print(f"  - {fp.label()}")
+
+
+def bind_fingerprint_for_proxy(proxy: StaticProxy, *, prefer_redis: bool = True):
+    """Bind a fingerprint to ``proxy`` — Redis queue first, else local regenerate/create."""
+    key = f"proxy:{_proxy_endpoint(proxy)}"
+    if prefer_redis and REDIS_ENABLED and REDIS_FP_ENABLED:
+        try:
+            rq = get_redis_queue()
+            raw = rq.pop_fingerprint(timeout=0)
+            if raw is not None:
+                fp = rebind_and_save_fingerprint(
+                    fingerprint_from_dict(raw, key=key, timezone_id="America/New_York"),
+                    key,
+                )
+                print(
+                    f"[指纹队列] 已领取 Redis 指纹 → {fp.label()} "
+                    f"(剩余 {rq.fingerprint_queue_length()})"
+                )
+                return fp
+            print("[指纹队列] 为空，回退本地生成指纹")
+        except Exception as exc:
+            print(f"[指纹队列] 领取失败，回退本地: {exc}")
+    if FINGERPRINT_ENABLED:
+        return regenerate_fingerprint(key, timezone_id="America/New_York")
+    return None
+
+
+def rotate_pool_proxy(worker_id: int = 0, *, reason: str = "") -> StaticProxy | None:
+    """Mark current pool proxy burned, assign next exclusive proxy + Redis/local fingerprint."""
+    if PROXY_MODE != "pool":
+        return None
+
+    proxies = load_static_proxies()
+    current = _worker_static_proxies.get(worker_id)
+    if current is not None:
+        burned_key = _proxy_endpoint(current)
+        _pool_burned.add(burned_key)
+        _pool_in_use.pop(worker_id, None)
+        _worker_static_proxies.pop(worker_id, None)
+        print(
+            f"[代理池] 标记屏蔽: {current.label()}"
+            + (f" | 原因: {reason}" if reason else "")
+            + f" | 已屏蔽 {len(_pool_burned)}/{len(proxies)}"
+        )
+
+    next_proxy = assign_pool_proxy(worker_id)
+    if FINGERPRINT_ENABLED:
+        fp = bind_fingerprint_for_proxy(next_proxy, prefer_redis=True)
+        print(
+            f"[代理池] 切换到 {next_proxy.label()}"
+            + (f" | 新指纹 {fp.label()}" if fp is not None else "")
+        )
+    else:
+        print(f"[代理池] 切换到 {next_proxy.label()}")
+    return next_proxy
 
 
 class RedisUrlQueue:
@@ -413,6 +649,40 @@ class RedisUrlQueue:
         except Exception:
             pass
 
+    def fingerprint_queue_length(self) -> int:
+        return int(self.client.llen(REDIS_FP_QUEUE_KEY))
+
+    def push_fingerprint(self, fp_dict: dict[str, Any]) -> int:
+        """LPUSH one fingerprint JSON; returns new queue length."""
+        payload = json.dumps(fp_dict, ensure_ascii=False)
+        return int(self.client.lpush(REDIS_FP_QUEUE_KEY, payload))
+
+    def push_fingerprints(self, items: list[dict[str, Any]]) -> int:
+        if not items:
+            return self.fingerprint_queue_length()
+        pipe = self.client.pipeline(transaction=False)
+        for item in items:
+            pipe.lpush(REDIS_FP_QUEUE_KEY, json.dumps(item, ensure_ascii=False))
+        pipe.execute()
+        return self.fingerprint_queue_length()
+
+    def pop_fingerprint(self, timeout: int = 0) -> dict[str, Any] | None:
+        """Pop one fingerprint. ``timeout=0`` is non-blocking RPOP; >0 uses BRPOP."""
+        if timeout and timeout > 0:
+            result = self.client.brpop(REDIS_FP_QUEUE_KEY, timeout=timeout)
+            if not result:
+                return None
+            raw = result[1]
+        else:
+            raw = self.client.rpop(REDIS_FP_QUEUE_KEY)
+            if not raw:
+                return None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
 
 _redis_queue: RedisUrlQueue | None = None
 
@@ -426,7 +696,9 @@ def get_redis_queue() -> RedisUrlQueue:
         _redis_queue = RedisUrlQueue(REDIS_URL)
         print(
             f"[Redis] 已连接 queue={REDIS_QUEUE_KEY} "
-            f"len={_redis_queue.queue_length()} seen={_redis_queue.seen_count()} role={REDIS_ROLE}"
+            f"len={_redis_queue.queue_length()} seen={_redis_queue.seen_count()} "
+            f"fps={_redis_queue.fingerprint_queue_length()}({REDIS_FP_QUEUE_KEY}) "
+            f"role={REDIS_ROLE}"
         )
     return _redis_queue
 
@@ -529,8 +801,10 @@ def build_webshare_proxy() -> dict[str, str] | None:
 
 
 def build_browser_proxy(worker_id: int = 0) -> dict[str, str] | None:
-    """按 PROXY_MODE 选择 rotate(Webshare) 或 static(本地代理列表)。"""
-    if PROXY_MODE == "static":
+    """按 PROXY_MODE 选择 rotate / static / pool / direct。"""
+    if PROXY_MODE == "direct":
+        return None
+    if PROXY_MODE in ("static", "pool"):
         return get_static_proxy_for_worker(worker_id).to_playwright()
     return build_webshare_proxy()
 
@@ -549,16 +823,29 @@ def webshare_proxy_label() -> str:
 
 
 def browser_proxy_label(worker_id: int = 0) -> str:
-    if PROXY_MODE == "static":
+    if PROXY_MODE == "direct":
+        return "direct 本机出口 IP（无代理）"
+    if PROXY_MODE in ("static", "pool"):
         try:
             proxy = get_static_proxy_for_worker(worker_id)
         except Exception as exc:
-            return f"static 模式错误: {exc}"
-        return f"static {proxy.label()} (file={PROXY_FILE.name})"
+            return f"{PROXY_MODE} 模式错误: {exc}"
+        prefix = "pool" if PROXY_MODE == "pool" else "static"
+        return f"{prefix} {proxy.label()} (burned={len(_pool_burned) if PROXY_MODE == 'pool' else 0})"
     return webshare_proxy_label()
 
 
 def proxy_mode_label() -> str:
+    if PROXY_MODE == "direct":
+        return "direct 本机出口 IP（无代理）"
+    if PROXY_MODE == "pool":
+        fp_src = "Redis指纹队列" if (REDIS_ENABLED and REDIS_FP_ENABLED) else "本地指纹"
+        return (
+            f"pool .env 代理 {len(FIXED_PROXY_POOL)} 条 | workers={WORKER_COUNT} | "
+            f"captcha_rounds={CAPTCHA_RECOVERY_ROUNDS} | "
+            f"pace≈{PRODUCT_PACE_SECONDS:.0f}s/商品 | "
+            f"屏蔽后换代理+{fp_src}"
+        )
     if PROXY_MODE == "static":
         return (
             f"static 固定代理 | file={PROXY_FILE} | index={PROXY_INDEX} | "
@@ -570,6 +857,11 @@ def proxy_mode_label() -> str:
 
 
 def captcha_restart_label() -> str:
+    if PROXY_MODE == "pool":
+        return (
+            f"验证码最多 {CAPTCHA_RECOVERY_ROUNDS} 轮；"
+            "未通过即判定屏蔽，清空 profile 并切换代理+指纹"
+        )
     total = CAPTCHA_RECOVERY_ROUNDS * MAX_CAPTCHA_RESTARTS_PER_URL
     return (
         f"单轮 {CAPTCHA_RECOVERY_ROUNDS} 次验证码尝试，"
@@ -585,18 +877,34 @@ def profile_policy_label() -> str:
 
 
 def resolve_fingerprint_for_worker(worker_id: int = 0):
-    """Bind fingerprint to static proxy identity (or worker id for rotate mode)."""
+    """Bind fingerprint to static/pool proxy identity (or worker id for rotate/direct)."""
     if not FINGERPRINT_ENABLED:
         return None
+    proxy = None
     proxy_label: str | None = None
-    if PROXY_MODE == "static":
+    if PROXY_MODE in ("static", "pool"):
         try:
             proxy = get_static_proxy_for_worker(worker_id)
             proxy_label = f"{proxy.host}:{proxy.port}"
         except Exception:
             proxy_label = None
     key = fingerprint_key_for_worker(worker_id, proxy_label)
-    timezone_id = "America/New_York" if (PROXY_MODE == "static" or WEBSHARE_COUNTRY == "us") else "UTC"
+    # direct: use local US Midwest default (host IP is Spectrum/MO); override via FP store.
+    if PROXY_MODE == "direct":
+        timezone_id = os.environ.get("FINGERPRINT_TIMEZONE", "America/Chicago").strip() or "America/Chicago"
+    elif PROXY_MODE in ("static", "pool") or WEBSHARE_COUNTRY == "us":
+        timezone_id = "America/New_York"
+    else:
+        timezone_id = "UTC"
+
+    # pool: reuse bound FP if present; otherwise claim from Redis fingerprint queue.
+    if PROXY_MODE == "pool" and proxy is not None:
+        existing = get_stored_fingerprint(key, timezone_id=timezone_id)
+        if existing is not None:
+            return existing
+        claimed = bind_fingerprint_for_proxy(proxy, prefer_redis=True)
+        if claimed is not None:
+            return claimed
     return load_or_create_fingerprint(key, timezone_id=timezone_id)
 
 
@@ -669,12 +977,19 @@ async def launch_browser_context(
                 context_kwargs["no_viewport"] = True
             if proxy:
                 context_kwargs["proxy"] = proxy
-            tz = (
-                fingerprint.timezone_id
-                if fingerprint
-                else ("America/New_York" if (PROXY_MODE == "static" or WEBSHARE_COUNTRY == "us") else None)
-            )
-            if proxy and tz:
+            if fingerprint:
+                tz = fingerprint.timezone_id
+            elif PROXY_MODE == "direct":
+                tz = (
+                    os.environ.get("FINGERPRINT_TIMEZONE", "America/Chicago").strip()
+                    or "America/Chicago"
+                )
+            elif PROXY_MODE in ("static", "pool") or WEBSHARE_COUNTRY == "us":
+                tz = "America/New_York"
+            else:
+                tz = None
+            # Apply timezone for proxy and direct local runs (skip only when unknown).
+            if tz and (proxy or PROXY_MODE == "direct"):
                 context_kwargs["timezone_id"] = tz
             context = await playwright.chromium.launch_persistent_context(
                 str(user_data_dir),
@@ -2300,6 +2615,17 @@ async def sleep(short: bool = False) -> None:
         low, high = max(300, low // 2), max(600, high // 2)
     await asyncio.sleep(random.randint(low, high) / 1000)
 
+
+async def pace_after_product() -> None:
+    """Slow crawl cadence after a successful product (~30s in pool mode)."""
+    if PRODUCT_PACE_SECONDS <= 0:
+        await sleep()
+        return
+    jitter = random.uniform(-3.0, 5.0)
+    delay = max(15.0, PRODUCT_PACE_SECONDS + jitter)
+    print(f"[节奏] 等待 {delay:.1f}s 后再抓下一个商品…")
+    await asyncio.sleep(delay)
+
 def resolve_xai_api_key() -> str:
     """Read xAI API key from .env (XAI_API_KEY or OPENAI_API_KEY)."""
     for name in ("XAI_API_KEY", "OPENAI_API_KEY"):
@@ -2734,7 +3060,7 @@ async def handle_captcha(
         print(f"[验证码识别] 第 {attempt}/{CAPTCHA_RECOVERY_ROUNDS} 轮：尝试通过验证码...")
 
         if XAI_API_KEY and CAPTCHA_AUTO_SOLVE:
-            print("[验证码识别] 自动识别验证码（单轮）。")
+            print("[验证码识别] 先用 Grok 自动识别验证码（单轮）。")
             await solve_captcha(page, max_rounds=1)
         else:
             if not XAI_API_KEY:
@@ -2811,13 +3137,17 @@ async def warmup_aliexpress_session(
         await page.wait_for_timeout(2500)
         await _dismiss_aliexpress_popups(page, worker_id=worker_id)
         if await is_captcha_page_visible(page):
-            print("[预热] 首页出现验证码，尝试 LLM 通过…")
+            print("[预热] 首页出现验证码，先用 Grok 尝试通过…")
             await handle_captcha(page, captcha_state, product_url=ALIEXPRESS_HOME_URL)
         await human_scroll(page, 1200, worker_id=worker_id)
         await human_idle(page, worker_id=worker_id, seconds=random.uniform(0.8, 1.6))
+    except BrowserRestartRequired:
+        raise
     except CaptchaKeepSessionError:
         print("[预热] 首页验证码未能通过，仍继续后续预热步骤（保留 session）")
     except Exception as exc:
+        if is_browser_closed_error(exc):
+            raise BrowserRestartRequired("预热首页时浏览器已关闭") from exc
         print(f"[预热] 首页访问异常: {exc}")
 
     # Category / channel links (never confuse with product /item/ pages)
@@ -2856,13 +3186,17 @@ async def warmup_aliexpress_session(
         await page.wait_for_timeout(2000)
         await _dismiss_aliexpress_popups(page, worker_id=worker_id)
         if await is_captcha_page_visible(page):
-            print("[预热] 分类页出现验证码，尝试 LLM 通过…")
+            print("[预热] 分类页出现验证码，先用 Grok 尝试通过…")
             await handle_captcha(page, captcha_state, product_url=category_href)
         await human_scroll(page, 1600, worker_id=worker_id)
         await human_idle(page, worker_id=worker_id, seconds=random.uniform(1.0, 2.0))
+    except BrowserRestartRequired:
+        raise
     except CaptchaKeepSessionError:
         print("[预热] 分类页验证码未能通过，继续尝试商品页")
     except Exception as exc:
+        if is_browser_closed_error(exc):
+            raise BrowserRestartRequired("预热分类页时浏览器已关闭") from exc
         print(f"[预热] 分类页异常: {exc}")
 
     product_href: str | None = None
@@ -2894,13 +3228,17 @@ async def warmup_aliexpress_session(
             await page.wait_for_timeout(2500)
             await _dismiss_aliexpress_popups(page, worker_id=worker_id)
             if await is_captcha_page_visible(page):
-                print("[预热] 商品页出现验证码，尝试 LLM 通过…")
+                print("[预热] 商品页出现验证码，先用 Grok 尝试通过…")
                 await handle_captcha(page, captcha_state, product_url=product_href)
             await human_scroll(page, 900, worker_id=worker_id)
             await human_idle(page, worker_id=worker_id, seconds=random.uniform(0.8, 1.5))
+        except BrowserRestartRequired:
+            raise
         except CaptchaKeepSessionError:
             print("[预热] 商品页验证码未能通过，预热结束（保留 session）")
         except Exception as exc:
+            if is_browser_closed_error(exc):
+                raise BrowserRestartRequired("预热商品页时浏览器已关闭") from exc
             print(f"[预热] 商品页异常: {exc}")
     else:
         print("[预热] 未找到商品链接，跳过商品页预热")
@@ -3536,21 +3874,39 @@ async def browser_worker(
         nonlocal browser, context, page, captcha_state, session_warmed, consecutive_captcha_fails
         if _session_alive(context, page):
             return
-        if context is not None or browser is not None:
-            await shutdown_session(clear_profile=False)
-        browser, context, page = await launch_browser_context(
-            playwright,
-            worker_id=worker_id,
-            clear_profile=False,
-        )
-        captcha_state = {"solved_once": False}
-        session_warmed = False
-        print(f"[{worker_label}] 浏览器已打开（代理: {browser_proxy_label(worker_id)}）")
-        if SESSION_WARMUP:
+
+        warmup_rotate_attempts = 0
+        max_warmup_rotates = len(FIXED_PROXY_POOL) if PROXY_MODE == "pool" else 0
+        while True:
+            if context is not None or browser is not None:
+                await shutdown_session(clear_profile=False)
+            browser, context, page = await launch_browser_context(
+                playwright,
+                worker_id=worker_id,
+                clear_profile=False,
+            )
+            captcha_state = {"solved_once": False}
+            session_warmed = False
+            print(f"[{worker_label}] 浏览器已打开（代理: {browser_proxy_label(worker_id)}）")
+            if not SESSION_WARMUP:
+                return
             assert page is not None
             try:
                 await warmup_aliexpress_session(page, captcha_state, worker_id=worker_id)
                 session_warmed = True
+                return
+            except BrowserRestartRequired as exc:
+                if PROXY_MODE == "pool" and warmup_rotate_attempts < max_warmup_rotates:
+                    warmup_rotate_attempts += 1
+                    print(
+                        f"[{worker_label}] 预热失败，换代理+指纹后重开 "
+                        f"({warmup_rotate_attempts}/{max_warmup_rotates}): {exc}"
+                    )
+                    await shutdown_session(clear_profile=True)
+                    rotate_pool_proxy(worker_id, reason=f"warmup:{exc}")
+                    await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+                    continue
+                raise
             except CaptchaKeepSessionError as exc:
                 consecutive_captcha_fails += 1
                 print(
@@ -3558,6 +3914,7 @@ async def browser_worker(
                     f"(连续失败 {consecutive_captcha_fails}/{PROXY_MAX_CONSECUTIVE_CAPTCHA})"
                 )
                 session_warmed = True
+                return
 
     try:
         while True:
@@ -3623,13 +3980,15 @@ async def browser_worker(
                     f"第 {batch_no} 批 {batch_pos}/{batch_size or '?'} 抓取详情: {url}"
                     + (
                         f" | 本代理已成功 {proxy_success_count}"
-                        if PROXY_MODE == "static"
+                        if PROXY_MODE in ("static", "pool")
                         else ""
                     )
                 )
                 try:
                     product_records = await fetch_product(page, url, captcha_state)
                     if not product_records:
+                        if PROXY_MODE == "pool":
+                            raise BrowserRestartRequired("未获取到商品数据，判定代理被屏蔽")
                         if CAPTCHA_KEEP_SESSION:
                             raise CaptchaKeepSessionError("未获取到商品数据，保留 session 换下一 URL")
                         raise BrowserRestartRequired("未获取到商品数据，不保存")
@@ -3642,7 +4001,7 @@ async def browser_worker(
                         consecutive_captcha_fails = 0
                         if save_result.get("primary_uploaded"):
                             proxy_success_count += 1
-                            if PROXY_MODE == "static":
+                            if PROXY_MODE in ("static", "pool"):
                                 print(
                                     f"[{worker_label}] 本代理累计成功: {proxy_success_count} "
                                     f"({browser_proxy_label(worker_id)})"
@@ -3661,8 +4020,35 @@ async def browser_worker(
                         print(f"  未写入 ES，URL 未标记为已处理，下次运行可重试: {url}")
                     task_queue.task_done()
                     pending_task = None
-                    await sleep()
+                    if save_result.get("primary_uploaded"):
+                        await pace_after_product()
+                    else:
+                        await sleep()
                 except CaptchaKeepSessionError as exc:
+                    if PROXY_MODE == "pool":
+                        # Keep-session is off for pool by default; treat as block just in case.
+                        print(f"[{worker_label}] 验证码未通过，切换代理+指纹: {exc}")
+                        await state.append_invalid(
+                            invalid_path,
+                            {
+                                "url": url,
+                                "product_id": product_id_from_url(url),
+                                "error": f"pool 验证码失败换代理: {exc}",
+                                "date": datetime.now().replace(microsecond=0).isoformat(),
+                                "proxy": browser_proxy_label(worker_id),
+                            },
+                        )
+                        await state.mark_url_done(failed=True)
+                        if state.redis_q is not None:
+                            await asyncio.to_thread(state.redis_q.requeue, url)
+                        await state.release_url(url)
+                        task_queue.task_done()
+                        pending_task = None
+                        await shutdown_session(clear_profile=True)
+                        rotate_pool_proxy(worker_id, reason=str(exc))
+                        await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+                        continue
+
                     consecutive_captcha_fails += 1
                     print(
                         f"[{worker_label}] {exc} "
@@ -3718,6 +4104,29 @@ async def browser_worker(
                     continue
 
                 url = pending_task[0]
+                if PROXY_MODE == "pool":
+                    print(f"[{worker_label}] {exc} → 判定当前代理被屏蔽，切换代理+指纹")
+                    await state.append_invalid(
+                        invalid_path,
+                        {
+                            "url": url,
+                            "product_id": product_id_from_url(url),
+                            "error": f"pool 屏蔽换代理: {exc}",
+                            "date": datetime.now().replace(microsecond=0).isoformat(),
+                            "proxy": browser_proxy_label(worker_id),
+                        },
+                    )
+                    await state.mark_url_done(failed=True)
+                    if state.redis_q is not None:
+                        await asyncio.to_thread(state.redis_q.requeue, url)
+                    await state.release_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    await shutdown_session(clear_profile=True)
+                    rotate_pool_proxy(worker_id, reason=str(exc))
+                    await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+                    continue
+
                 if CAPTCHA_KEEP_SESSION:
                     # Defensive: map unexpected hard-restart into keep-session path.
                     consecutive_captcha_fails += 1
@@ -3794,6 +4203,29 @@ async def browser_worker(
                     f"{MAX_NETWORK_RESTARTS_PER_URL}。"
                 )
                 wipe = should_clear_profile_for_error(exc)
+                if PROXY_MODE == "pool" and retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
+                    print(f"[{worker_label}] 网络/不完整失败，切换代理+指纹: {exc}")
+                    await state.append_invalid(
+                        invalid_path,
+                        {
+                            "url": url,
+                            "product_id": product_id_from_url(url),
+                            "error": f"pool 网络失败换代理: {exc}",
+                            "date": datetime.now().replace(microsecond=0).isoformat(),
+                            "proxy": browser_proxy_label(worker_id),
+                        },
+                    )
+                    await state.mark_url_done(failed=True)
+                    if state.redis_q is not None:
+                        await asyncio.to_thread(state.redis_q.requeue, url)
+                    await state.release_url(url)
+                    task_queue.task_done()
+                    pending_task = None
+                    await shutdown_session(clear_profile=True)
+                    rotate_pool_proxy(worker_id, reason=str(exc))
+                    await asyncio.sleep(BROWSER_RESTART_DELAY_SECONDS)
+                    continue
+
                 if CAPTCHA_KEEP_SESSION and PROXY_MODE == "static":
                     # static 模式：网络/不完整也不随便换代理，尽量保留 session 换下一 URL
                     if retry_count >= MAX_NETWORK_RESTARTS_PER_URL:
@@ -3848,10 +4280,10 @@ async def browser_worker(
             if await state.should_stop():
                 break
     finally:
-        if PROXY_MODE == "static":
+        if PROXY_MODE in ("static", "pool"):
             print(
                 f"[{worker_label}] 代理容量统计: 成功={proxy_success_count} "
-                f"连续验证码失败={consecutive_captcha_fails} | {proxy_label}"
+                f"连续验证码失败={consecutive_captcha_fails} | {browser_proxy_label(worker_id)}"
             )
         await shutdown_session(clear_profile=False)
         print(f"[{worker_label}] 结束")
@@ -4176,6 +4608,18 @@ async def main_async() -> None:
         except Exception as exc:
             print(f"错误: static 代理模式无法加载代理文件: {exc}")
             raise SystemExit(1) from exc
+    elif PROXY_MODE == "pool":
+        try:
+            proxies = load_static_proxies()
+            print(f"固定代理池: 已加载 {len(proxies)} 条（来自 .env POOL_PROXIES）")
+            for p in proxies:
+                print(f"  - {p.label()}")
+            prepare_pool_fingerprints(force_regenerate=False)
+        except Exception as exc:
+            print(f"错误: pool 代理模式初始化失败: {exc}")
+            raise SystemExit(1) from exc
+        if PRODUCT_PACE_SECONDS > 0:
+            print(f"抓取节奏: 约 {PRODUCT_PACE_SECONDS:.0f}s/商品")
     print(f"详情输出目录: {OUTPUT_DIR}")
     print(f"并发 Worker 数: {WORKER_COUNT}")
     if WORKER_COUNT > 1:

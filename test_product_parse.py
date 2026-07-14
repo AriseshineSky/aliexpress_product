@@ -486,6 +486,79 @@ class ProductParseTestCase(unittest.TestCase):
                 fp2 = load_or_create_fingerprint("proxy:10.0.0.1:1")
                 self.assertEqual(fp1.seed, fp2.seed)
                 self.assertTrue(stealth_fp.FINGERPRINT_STORE.exists())
+                fp3 = stealth_fp.regenerate_fingerprint("proxy:10.0.0.1:1")
+                fp4 = load_or_create_fingerprint("proxy:10.0.0.1:1")
+                self.assertEqual(fp3.seed, fp4.seed)
+                self.assertNotEqual(fp1.seed, fp3.seed)
+
+                keys = [f"proxy:pool-{i}" for i in range(5)]
+                fps = stealth_fp.ensure_diverse_fingerprints(keys, force_regenerate=True)
+                self.assertEqual(len(fps), 5)
+                sigs = {stealth_fp.fingerprint_signature(fp) for fp in fps}
+                self.assertEqual(len(sigs), 5)
+            finally:
+                stealth_fp.FINGERPRINT_STORE = original
+
+    def test_fixed_proxy_pool_has_five(self):
+        import os
+        import importlib
+
+        os.environ["PROXY_MODE"] = "pool"
+        os.environ["WORKER_COUNT"] = "3"
+        os.environ["POOL_PROXIES"] = (
+            "63.141.62.32:6325:u:p|192.53.70.34:5748:u:p|"
+            "45.56.177.38:8839:u:p|9.142.10.10:5666:u:p|192.46.190.31:6624:u:p"
+        )
+        import alixq3
+
+        importlib.reload(alixq3)
+        try:
+            self.assertEqual(alixq3.PROXY_MODE, "pool")
+            proxies = alixq3.load_fixed_proxy_pool()
+            self.assertEqual(len(proxies), 5)
+            self.assertEqual(proxies[0].host, "63.141.62.32")
+            self.assertEqual(alixq3.WORKER_COUNT, 3)
+            self.assertEqual(alixq3.CAPTCHA_RECOVERY_ROUNDS, 1)
+            self.assertTrue(alixq3.REDIS_FP_ENABLED)
+            a = alixq3.assign_pool_proxy(0)
+            b = alixq3.assign_pool_proxy(1)
+            self.assertNotEqual(
+                f"{a.host}:{a.port}",
+                f"{b.host}:{b.port}",
+            )
+        finally:
+            os.environ.pop("PROXY_MODE", None)
+            os.environ.pop("WORKER_COUNT", None)
+            os.environ.pop("POOL_PROXIES", None)
+            importlib.reload(alixq3)
+
+    def test_fingerprint_redis_roundtrip_helpers(self):
+        from stealth_fp import (
+            fingerprint_from_dict,
+            fingerprint_to_dict,
+            mint_random_fingerprint,
+            rebind_and_save_fingerprint,
+            get_stored_fingerprint,
+        )
+        import tempfile
+        from pathlib import Path
+        import stealth_fp
+
+        fp = mint_random_fingerprint(timezone_id="America/New_York")
+        raw = fingerprint_to_dict(fp)
+        self.assertIn("user_agent", raw)
+        parsed = fingerprint_from_dict(raw, key="proxy:1.2.3.4:80")
+        self.assertEqual(parsed.key, "proxy:1.2.3.4:80")
+        self.assertEqual(parsed.user_agent, fp.user_agent)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original = stealth_fp.FINGERPRINT_STORE
+            try:
+                stealth_fp.FINGERPRINT_STORE = Path(tmp) / "fps.json"
+                bound = rebind_and_save_fingerprint(fp, "proxy:9.9.9.9:1")
+                loaded = get_stored_fingerprint("proxy:9.9.9.9:1")
+                self.assertIsNotNone(loaded)
+                self.assertEqual(bound.seed, loaded.seed)
             finally:
                 stealth_fp.FINGERPRINT_STORE = original
 

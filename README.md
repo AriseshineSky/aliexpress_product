@@ -84,8 +84,26 @@ start.bat
 |--------------|------|
 | `rotate`（默认） | 现有 Webshare 网关 + rotate，硬失败可换 IP |
 | `static` | 使用 `data/*.txt` 固定代理（`host:port:user:pass`），同一会话保持 IP/cookies |
+| `pool` | `.env` 的 `POOL_PROXIES`；验证码 1 轮失败即换代理+指纹；约 30s/商品；并发读 `WORKER_COUNT` |
+| `direct` | 本机出口 IP（无代理） |
 
 `static` 模式会先预热首页→分类→商品页，验证码 LLM 失败后**保留 session**并换下一 URL；连续失败达到 `PROXY_MAX_CONSECUTIVE_CAPTCHA` 后停止该 Worker。
+
+`pool` 模式监听同一 Redis URL 队列；被屏蔽时清空 profile，换下一个空闲代理，并优先从 Redis 指纹队列 `alixq3:fps` 领取新指纹（队列空则本地 regenerate）。代理写在 `.env`：
+
+```bash
+PROXY_MODE=pool
+POOL_PROXIES="1.2.3.4:8080:user:pass|5.6.7.8:9090:user:pass"
+WORKER_COUNT=3
+```
+
+```bash
+# 指纹生产机（可多机灌队列）
+.venv/bin/python scripts/seed_fingerprints_redis.py --count 100 --diverse
+
+# 抓取机（并发数用 .env WORKER_COUNT；可用 --workers 临时覆盖）
+.venv/bin/python scripts/run_fixed_pool.py --pace 30 --headless 0
+```
 
 反检测（默认开启）：`playwright-stealth` + 与代理绑定的 Canvas/WebGL 指纹池（`data/fingerprints.json`）+ 贝塞尔鼠标轨迹。可用 `STEALTH_ENABLED` / `FINGERPRINT_ENABLED` / `HUMAN_MOUSE_ENABLED` 开关。
 
