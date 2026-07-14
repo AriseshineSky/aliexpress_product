@@ -34,7 +34,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--proxy-file",
         type=str,
-        default=str(BASE_DIR / "data" / "Webshare 1000 proxies.txt"),
+        default=str(
+            next(
+                (
+                    p
+                    for p in (
+                        BASE_DIR / "data" / "Webshare 100 proxies.txt",
+                        BASE_DIR / "data" / "Webshare 1000 proxies.txt",
+                    )
+                    if p.exists()
+                ),
+                BASE_DIR / "data" / "Webshare 100 proxies.txt",
+            )
+        ),
         help="Path to host:port:user:pass list",
     )
     parser.add_argument(

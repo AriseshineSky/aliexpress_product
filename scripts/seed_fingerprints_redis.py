@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Generate browser fingerprints and push them to the Redis fingerprint queue.
+"""Generate Windows Chrome fingerprints and push them to the Redis queue.
 
-Run on any machine that can reach Redis (does not need a browser).
+Profiles are Windows desktop only (platform=Win32, Windows NT 10 Chrome UA,
+Direct3D11 ANGLE GPUs). Run on any machine that can reach Redis — typically
+the Windows VPS producer host. No browser is required.
 
 Usage:
-  .venv/bin/python scripts/seed_fingerprints_redis.py --count 100
-  .venv/bin/python scripts/seed_fingerprints_redis.py --count 50 --diverse
-  .venv/bin/python scripts/seed_fingerprints_redis.py --status
+  .venv\\Scripts\\python.exe scripts\\seed_fingerprints_redis.py --count 200 --diverse
+  .venv\\Scripts\\python.exe scripts\\seed_fingerprints_redis.py --status
+  seed-fingerprints.bat 200
 """
 
 from __future__ import annotations
@@ -21,12 +23,14 @@ sys.path.insert(0, str(BASE_DIR))
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Seed Redis fingerprint queue (alixq3:fps)")
+    parser = argparse.ArgumentParser(
+        description="Seed Redis with Windows Chrome fingerprints (alixq3:fps)"
+    )
     parser.add_argument(
         "--count",
         type=int,
-        default=50,
-        help="How many fingerprints to generate and push (default 50)",
+        default=100,
+        help="How many Windows fingerprints to generate and push (default 100)",
     )
     parser.add_argument(
         "--diverse",
@@ -43,6 +47,13 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="America/New_York",
         help="timezone_id stored on each fingerprint",
+    )
+    parser.add_argument(
+        "--os",
+        dest="host_os",
+        choices=("windows",),
+        default="windows",
+        help="Fingerprint host OS family (only windows is supported)",
     )
     return parser.parse_args()
 
@@ -70,6 +81,7 @@ def main() -> None:
     rq = alixq3.get_redis_queue()
     print(f"指纹队列: {alixq3.REDIS_FP_QUEUE_KEY}")
     print(f"当前长度: {rq.fingerprint_queue_length()}")
+    print(f"目标主机指纹: {args.host_os} (Win32 / Chrome / Direct3D11)")
     if args.status:
         return
 
@@ -84,20 +96,32 @@ def main() -> None:
     while len(items) < args.count and attempts < max_attempts:
         attempts += 1
         fp = mint_random_fingerprint(timezone_id=args.timezone)
+        # Guard: producer must only enqueue Windows desktop profiles.
+        if fp.platform != "Win32" or "Windows NT" not in fp.user_agent:
+            continue
         sig = fingerprint_signature(fp)
         if args.diverse and sig in used:
             continue
         used.add(sig)
-        items.append(fingerprint_to_dict(fp))
+        payload = fingerprint_to_dict(fp)
+        payload["host_os"] = "windows"
+        items.append(payload)
+
+    if len(items) < args.count:
+        print(
+            f"警告: 只生成了 {len(items)}/{args.count} 条 "
+            f"（尝试 {attempts} 次，可能--diverse 签名池不够大）"
+        )
 
     length = rq.push_fingerprints(items)
-    print(f"已推入 {len(items)} 条指纹（尝试 {attempts} 次），队列长度={length}")
+    print(f"已推入 {len(items)} 条 Windows 指纹（尝试 {attempts} 次），队列长度={length}")
     if items:
         sample = items[0]
         print(
-            f"示例: ua={sample.get('user_agent', '')[:60]}… "
+            f"示例: platform={sample.get('platform')} "
+            f"ua={str(sample.get('user_agent', ''))[:70]}… "
             f"vp={sample.get('viewport_width')}x{sample.get('viewport_height')} "
-            f"gpu={str(sample.get('webgl_renderer', ''))[:40]}"
+            f"gpu={str(sample.get('webgl_renderer', ''))[:48]}"
         )
 
 

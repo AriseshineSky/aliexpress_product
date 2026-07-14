@@ -55,6 +55,36 @@ Write-Host ""
 
 if ($proxyMode -eq "pool") {
     Write-Host "==> Starting scripts/run_fixed_pool.py (homepage warmup + proxy pool)"
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $configCheck = & $venvPython -c @'
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(Path(".env"))
+os.environ["PROXY_MODE"] = "pool"
+from alixq3 import (
+    WORKER_COUNT, HEADLESS, SESSION_WARMUP, REDIS_ENABLED, REDIS_ROLE,
+    PRODUCT_PACE_SECONDS, POOL_PICK, FIXED_PROXY_POOL, PROXY_FILE,
+)
+n = len(FIXED_PROXY_POOL)
+src = "POOL_PROXIES" if n else f"file:{Path(PROXY_FILE).name}"
+print(
+    f"WORKER_COUNT={WORKER_COUNT} HEADLESS={HEADLESS} WARMUP={SESSION_WARMUP} "
+    f"PACE={PRODUCT_PACE_SECONDS:g}s PICK={POOL_PICK} PROXIES={n or src} "
+    f"REDIS={REDIS_ENABLED} ROLE={REDIS_ROLE}"
+)
+'@ 2>&1
+    $configExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+    if ($configExit -eq 0) {
+        Write-Host "Config: $configCheck"
+    } else {
+        Write-Warning "Config check failed: $configCheck"
+    }
+    Write-Host ""
+    Write-Host "Tip: seed Windows fingerprints first if queue is empty:"
+    Write-Host "  seed-fingerprints.bat 200"
     Write-Host ""
     & $venvPython scripts/run_fixed_pool.py
     exit $LASTEXITCODE

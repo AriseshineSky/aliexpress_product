@@ -543,6 +543,46 @@ class ProductParseTestCase(unittest.TestCase):
             os.environ.pop("POOL_PROXIES", None)
             importlib.reload(alixq3)
 
+    def test_pool_loads_from_data_proxy_file(self):
+        import os
+        import importlib
+        from pathlib import Path
+
+        proxy_file = Path("data/Webshare 100 proxies.txt")
+        if not proxy_file.exists():
+            proxy_file = Path("data/Webshare 1000 proxies.txt")
+        if not proxy_file.exists():
+            self.skipTest("data Webshare proxy list missing")
+
+        os.environ["PROXY_MODE"] = "pool"
+        os.environ["POOL_PROXIES"] = ""
+        os.environ["POOL_PICK"] = "random"
+        os.environ["PROXY_FILE"] = str(proxy_file.resolve())
+        os.environ["POOL_PROXY_LIMIT"] = "5"
+        os.environ["WORKER_COUNT"] = "1"
+        import alixq3
+
+        importlib.reload(alixq3)
+        try:
+            proxies = alixq3.load_fixed_proxy_pool()
+            self.assertEqual(len(proxies), 5)
+            a = alixq3.assign_pool_proxy(0)
+            alixq3.rotate_pool_proxy(0, reason="captcha")
+            b = alixq3.get_static_proxy_for_worker(0)
+            self.assertNotEqual(f"{a.host}:{a.port}", f"{b.host}:{b.port}")
+            self.assertEqual(alixq3.POOL_PICK, "random")
+        finally:
+            for key in (
+                "PROXY_MODE",
+                "POOL_PROXIES",
+                "POOL_PICK",
+                "PROXY_FILE",
+                "POOL_PROXY_LIMIT",
+                "WORKER_COUNT",
+            ):
+                os.environ.pop(key, None)
+            importlib.reload(alixq3)
+
     def test_fingerprint_redis_roundtrip_helpers(self):
         from stealth_fp import (
             fingerprint_from_dict,

@@ -74,6 +74,12 @@ scripts\install.bat
 start.bat
 ```
 
+当 `.env` 中 `PROXY_MODE=pool` 时，`start.bat` 会自动走 `run_fixed_pool.py`（首页预热、随机换 IP+指纹）。建议先在一台 Windows 机灌指纹：
+
+```powershell
+seed-fingerprints.bat 200
+```
+
 输出目录：`产品详情/`（本地 jsonl + 进度文件）
 
 浏览器使用 persistent profile（`browser_playwright/`），同一 Worker 会复用会话连续抓多个商品；**只有确认无法获取商品信息**（验证码/网络错误/字段不完整等硬失败）时才会清空 profile 并硬重启。本地试跑可在 `.env` 设 `MAX_PRODUCTS=1`、`WORKER_COUNT=1`、`HEADLESS=0`。
@@ -84,25 +90,36 @@ start.bat
 |--------------|------|
 | `rotate`（默认） | 现有 Webshare 网关 + rotate，硬失败可换 IP |
 | `static` | 使用 `data/*.txt` 固定代理（`host:port:user:pass`），同一会话保持 IP/cookies |
-| `pool` | `.env` 的 `POOL_PROXIES`；遇验证码不求解，换指纹并循环代理（IP 不屏蔽）；约 15s/商品；并发读 `WORKER_COUNT` |
+| `pool` | `.env` 的 `POOL_PROXIES`；默认随机选 IP；遇验证码不求解，随机换 IP+指纹（不屏蔽）；约 15s/商品 |
 | `direct` | 本机出口 IP（无代理） |
 
 `static` 模式会先预热首页→分类→商品页，验证码 LLM 失败后**保留 session**并换下一 URL；连续失败达到 `PROXY_MAX_CONSECUTIVE_CAPTCHA` 后停止该 Worker。
 
-`pool` 模式监听同一 Redis URL 队列；出现验证码时不清求解、不清屏蔽 IP，清空 profile 后换指纹并循环到下一个空闲代理（原 IP 仍可复用），优先从 Redis 指纹队列 `alixq3:fps` 领指纹。代理写在 `.env`：
+`pool` 模式监听同一 Redis URL 队列；出现验证码时不求解、不屏蔽 IP，清空 profile 后**随机换一个 IP + 新指纹**（原 IP 仍可复用），优先从 Redis 指纹队列 `alixq3:fps` 领指纹。代理写在 `.env`：
 
 ```bash
 PROXY_MODE=pool
+POOL_PICK=random
 POOL_PROXIES="1.2.3.4:8080:user:pass|5.6.7.8:9090:user:pass"
 WORKER_COUNT=3
 ```
 
 ```bash
-# 指纹生产机（可多机灌队列）
-.venv/bin/python scripts/seed_fingerprints_redis.py --count 100 --diverse
+# 从 data/Webshare 100 proxies.txt 写入 .env（默认随机抽样）
+.venv/bin/python scripts/sync_env_pool_proxies.py --count 100
+
+# Windows 指纹生产机（灌 Redis 队列 alixq3:fps；profile=Win32/Chrome）
+# Windows VPS:
+#   seed-fingerprints.bat 200
+#   powershell -File scripts\seed-fingerprints.ps1 -Count 500
+.venv/bin/python scripts/seed_fingerprints_redis.py --count 200 --diverse
+.venv/bin/python scripts/seed_fingerprints_redis.py --status
 
 # 抓取机（并发数用 .env WORKER_COUNT；可用 --workers 临时覆盖）
 .venv/bin/python scripts/run_fixed_pool.py --pace 15 --headless 0
+
+# 本地直接读 data 文件（可不写 .env POOL_PROXIES）
+.venv/bin/python scripts/run_data_proxies.py --workers 1 --pace 15 --headless 0
 ```
 
 反检测（默认开启）：`playwright-stealth` + 与代理绑定的 Canvas/WebGL 指纹池（`data/fingerprints.json`）+ 贝塞尔鼠标轨迹。可用 `STEALTH_ENABLED` / `FINGERPRINT_ENABLED` / `HUMAN_MOUSE_ENABLED` 开关。

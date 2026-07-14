@@ -5,7 +5,7 @@ Behavior (forced via env before importing alixq3):
   - PROXY_MODE=pool
   - Concurrent workers from .env WORKER_COUNT (or --workers); capped by proxy count
   - ~15 seconds pacing between successful products (per worker)
-  - Captcha: do not solve; cycle proxy + new fingerprint (IPs stay reusable, never burned)
+  - Captcha: do not solve; randomly switch proxy + new fingerprint (IPs stay reusable)
   - Same Redis URL queue as the main crawler
 
 Fingerprint producer (another machine/process):
@@ -126,7 +126,7 @@ def main() -> None:
     print(f"预热: {'on' if alixq3.SESSION_WARMUP else 'off'}（首页→分类→商品）")
     print(
         f"验证码: 不求解（轮数={alixq3.CAPTCHA_RECOVERY_ROUNDS}）；"
-        "出现则换指纹并循环代理，IP 不屏蔽"
+        f"出现则{('随机' if alixq3.POOL_PICK == 'random' else '顺序')}换 IP+指纹，IP 不屏蔽"
     )
     print(f"Redis URL 队列: {alixq3.REDIS_ROLE if alixq3.REDIS_ENABLED else '未配置'}")
     if alixq3.REDIS_ENABLED and alixq3.REDIS_FP_ENABLED:
