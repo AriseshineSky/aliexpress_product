@@ -84,6 +84,14 @@ seed-fingerprints.bat 200
 
 浏览器使用 persistent profile（`browser_playwright/`），同一 Worker 会复用会话连续抓多个商品；**只有确认无法获取商品信息**（验证码/网络错误/字段不完整等硬失败）时才会清空 profile 并硬重启。本地试跑可在 `.env` 设 `MAX_PRODUCTS=1`、`WORKER_COUNT=1`、`HEADLESS=0`。
 
+本机 Google Chrome + 隧道代理（rotate）+ LLM 验证码单线程试跑：
+
+```bash
+.venv/bin/python scripts/test_local_chrome_rotate.py --max-products 1
+```
+
+也可用环境变量：`BROWSER_CHANNEL=chrome`、`NATIVE_BROWSER=1`、`PROXY_MODE=rotate`。
+
 ### 代理模式
 
 | `PROXY_MODE` | 说明 |
@@ -122,7 +130,7 @@ WORKER_COUNT=3
 .venv/bin/python scripts/run_data_proxies.py --workers 1 --pace 15 --headless 0
 ```
 
-反检测（默认开启）：`playwright-stealth` + 与代理绑定的 Canvas/WebGL 指纹池（`data/fingerprints.json`）+ 贝塞尔鼠标轨迹。可用 `STEALTH_ENABLED` / `FINGERPRINT_ENABLED` / `HUMAN_MOUSE_ENABLED` 开关。
+反检测（默认开启）：`playwright-stealth` + 与代理绑定的 Canvas/WebGL 指纹池（`data/fingerprints.json`）+ 贝塞尔鼠标轨迹。可用 `STEALTH_ENABLED` / `FINGERPRINT_ENABLED` / `HUMAN_MOUSE_ENABLED` 开关。指纹 OS 默认 `FINGERPRINT_OS=auto`（本机是 macOS 则生成 `MacIntel` + Macintosh UA；Windows 机器则用 Win32）。旧的 Win32 缓存会在下次加载时按当前 OS 自动重建。
 
 单代理容量测试：
 
@@ -152,6 +160,24 @@ scripts\start.bat
 ./install.sh    # 首次
 ./start.sh      # 启动抓取
 ```
+
+## 定时灌 Redis 队列
+
+每 4 小时清空 `alixq3:urls`，再把产品索引里还没有的 URL 按优先规则入队（严格优先 → 星级/评论/销量）。生产部署在 mongo VPS。
+
+```bash
+# 安装 crontab（整点每 4 小时，如 0:00 / 4:00 / …）
+./scripts/install_seed_cron.sh install
+
+# 立刻跑一次 / 查看 / 卸载
+./scripts/install_seed_cron.sh run-once
+./scripts/install_seed_cron.sh status
+./scripts/install_seed_cron.sh uninstall
+
+# 改间隔：SEED_CRON_HOURS=2 ./scripts/install_seed_cron.sh install
+```
+
+日志：`logs/seed_redis_scheduled.log`
 
 ## 测试
 

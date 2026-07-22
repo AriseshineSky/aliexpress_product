@@ -15,6 +15,7 @@ venv/
 产品详情/
 browser_playwright/
 img/
+logs/
 *.jsonl
 *.log
 
